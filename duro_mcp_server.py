@@ -182,6 +182,44 @@ async def list_tools() -> list[Tool]:
                 "required": ["task", "error", "lesson"]
             }
         ),
+        Tool(
+            name="duro_compress_logs",
+            description="Compress old memory logs into summaries. Archives raw logs and creates compact summaries for faster context loading. Run this periodically to keep context size manageable.",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        Tool(
+            name="duro_query_archive",
+            description="Search or retrieve archived raw memory logs. Use when you need full detail from past sessions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "Specific date to retrieve (YYYY-MM-DD format)"
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Search query to find in archives"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return",
+                        "default": 5
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="duro_list_archives",
+            description="List all available archived memory logs with their sizes.",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
 
         # Skills tools
         Tool(
@@ -925,23 +963,47 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             include_soul = arguments.get("include_soul", True)
             recent_days = arguments.get("recent_days", 3)
 
-            context = memory.load_full_context()
+            # Auto-compress old logs before loading (keeps context lean)
+            compress_results = memory.compress_old_logs()
 
             result = []
-            if include_soul and context.get("soul"):
-                result.append(f"## Soul Configuration\n{context['soul'][:2000]}...")
 
-            if context.get("core_memory"):
-                result.append(f"## Core Memory\n{context['core_memory']}")
+            # Soul (truncated if very long)
+            if include_soul:
+                soul = memory.load_soul()
+                if soul:
+                    if len(soul) > 2000:
+                        result.append(f"## Soul Configuration\n{soul[:2000]}...")
+                    else:
+                        result.append(f"## Soul Configuration\n{soul}")
 
-            if context.get("today_memory"):
-                result.append(f"## Today's Memory\n{context['today_memory']}")
+            # Core memory
+            core = memory.load_core_memory()
+            if core:
+                result.append(f"## Core Memory\n{core}")
 
-            recent = context.get("recent_memories", {})
-            if recent:
-                result.append("## Recent Memory")
-                for date, content in list(recent.items())[:recent_days]:
-                    result.append(f"### {date}\n{content[:500]}...")
+            # Today's memory (full raw log)
+            today = memory.load_today_memory()
+            if today:
+                result.append(f"## Today's Memory\n{today}")
+
+            # Recent memory (hybrid: summaries for old days)
+            recent = memory.load_recent_memory(days=recent_days, use_summaries=True)
+            today_date = datetime.now().strftime("%Y-%m-%d")
+
+            # Filter out today (already shown above)
+            older_days = {k: v for k, v in recent.items() if k != today_date}
+            if older_days:
+                result.append("## Recent Memory (Summaries)")
+                for date, content in list(older_days.items()):
+                    result.append(f"### {date}\n{content}")
+
+            # Add stats footer
+            stats = memory.get_memory_stats()
+            if compress_results:
+                compressed_dates = [d for d, s in compress_results.items() if "compressed" in s]
+                if compressed_dates:
+                    result.append(f"\n*Auto-compressed {len(compressed_dates)} old log(s). Use `duro_query_archive` to access full details.*")
 
             text = "\n\n".join(result) if result else "No context loaded."
             return [TextContent(type="text", text=text)]
@@ -973,6 +1035,59 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             lesson = arguments["lesson"]
             success = memory.save_failure(task, error, lesson)
             text = "Failure logged with lesson." if success else "Failed to log failure."
+            return [TextContent(type="text", text=text)]
+
+        elif name == "duro_compress_logs":
+            results = memory.compress_old_logs()
+            if results:
+                text = "## Memory Compression Results\n\n"
+                for date, status in results.items():
+                    text += f"- **{date}**: {status}\n"
+                stats = memory.get_memory_stats()
+                text += f"\n**Current stats:** {stats['active_logs']} active, {stats['summaries']} summaries, {stats['archived_logs']} archived"
+            else:
+                text = "No logs to compress. Only today's log is active."
+            return [TextContent(type="text", text=text)]
+
+        elif name == "duro_query_archive":
+            date = arguments.get("date")
+            search = arguments.get("search")
+            limit = arguments.get("limit", 5)
+
+            if date:
+                # Retrieve specific archived log
+                content = memory.load_archived_log(date)
+                if content:
+                    text = f"## Archived Log: {date}\n\n{content}"
+                else:
+                    text = f"No archived log found for {date}"
+            elif search:
+                # Search through archives
+                results = memory.search_archives(search, limit)
+                if results:
+                    text = f"## Search Results: '{search}'\n\n"
+                    for r in results:
+                        text += f"### {r['date']}\n"
+                        for match in r['matches']:
+                            text += f"- Line {match['line_num']}: {match['text']}\n"
+                        text += "\n"
+                else:
+                    text = f"No matches found for '{search}' in archives"
+            else:
+                text = "Please provide either 'date' or 'search' parameter"
+            return [TextContent(type="text", text=text)]
+
+        elif name == "duro_list_archives":
+            archives = memory.list_available_archives()
+            if archives:
+                text = "## Available Archives\n\n"
+                total_size = 0
+                for a in archives:
+                    text += f"- **{a['date']}**: {a['size_kb']} KB\n"
+                    total_size += a['size_bytes']
+                text += f"\n**Total:** {len(archives)} archives, {round(total_size/1024, 1)} KB"
+            else:
+                text = "No archives available. Run `duro_compress_logs` to archive old memory logs."
             return [TextContent(type="text", text=text)]
 
         # Skills tools
