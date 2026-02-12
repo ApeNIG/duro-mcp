@@ -279,6 +279,105 @@ def run_smoke_tests():
         all_passed = False
 
     # =========================================================
+    # TEST 4: Guardrail - Block Updates for Skills Not in skills_used
+    # =========================================================
+    print("\n--- TEST 4: Guardrail - Block Unauthorized Skill Updates ---\n")
+
+    # Get baseline for both skills
+    baseline_planning = store.get_artifact("ss_planning")["data"]["confidence"]
+    store.ensure_skill_stats("source_verification", "Source Verification", confidence=0.5)
+    store.reindex()
+    baseline_sv = store.get_artifact("ss_source_verification")["data"]["confidence"]
+
+    log(f"Baseline ss_planning: {baseline_planning}")
+    log(f"Baseline ss_source_verification: {baseline_sv}")
+
+    # Create episode with skills_used=["planning"] only
+    success, ep_id4, _ = store.store_episode(
+        goal="Smoke test - guardrail verification",
+        plan=["Test guardrail blocks unauthorized updates"],
+        tags=["smoke-test", "guardrail"],
+        context={"test_type": "guardrail_test"}
+    )
+    if not success:
+        log(f"Failed to create episode: {ep_id4}", "FAIL")
+        return False
+    log(f"Created episode: {ep_id4}")
+
+    # Close with skills_used=["planning"] - NOT source_verification
+    success, msg = store.update_episode(ep_id4, {
+        "status": "closed",
+        "result": "success",
+        "result_summary": "Guardrail test",
+        "links": {"skills_used": ["planning"]}  # Only planning!
+    })
+    if not success:
+        log(f"Failed to close episode: {msg}", "FAIL")
+        return False
+    log("Closed episode with skills_used=[planning] only")
+
+    # Try to sneak in an update for ss_source_verification (should be blocked)
+    success, eval_id4, _ = store.store_evaluation(
+        episode_id=ep_id4,
+        rubric={
+            "outcome_quality": {"score": 5, "notes": "Guardrail test"},
+            "cost": {"tools_used": 1, "duration_mins": 0.1, "tokens_bucket": "XS"},
+            "correctness_risk": {"score": 0, "notes": "Test only"},
+            "reusability": {"score": 5, "notes": "Automated"},
+            "reproducibility": {"score": 5, "notes": "Deterministic"}
+        },
+        grade="A",
+        memory_updates={
+            # Trying to update source_verification - should be BLOCKED by guardrail
+            "reinforce": [{"type": "skill_stats", "id": "ss_source_verification", "delta": 0.02}],
+            "decay": []
+        }
+        # auto_skill_updates=True (default) - should auto-add planning
+    )
+    if not success:
+        log(f"Failed to create evaluation: {eval_id4}", "FAIL")
+        return False
+    log(f"Created evaluation with sneaky ss_source_verification update: {eval_id4}")
+
+    # Check what actually made it into the evaluation
+    eval_artifact = store.get_artifact(eval_id4)
+    reinforce_items = eval_artifact["data"]["memory_updates"]["reinforce"]
+    ids_in_updates = [item.get("id") for item in reinforce_items]
+
+    # ss_source_verification should NOT be in the updates (guardrail filtered it)
+    if "ss_source_verification" in ids_in_updates:
+        log("GUARDRAIL FAILED: ss_source_verification was NOT filtered out", "FAIL")
+        all_passed = False
+    else:
+        log("Guardrail filtered out ss_source_verification (not in skills_used)", "PASS")
+
+    # ss_planning SHOULD be in the updates (auto-generated)
+    if "ss_planning" in ids_in_updates:
+        log("Auto-generated ss_planning update present", "PASS")
+    else:
+        log("Auto-generated ss_planning update missing", "FAIL")
+        all_passed = False
+
+    # Apply and verify
+    success, msg, _ = store.apply_evaluation(eval_id4)
+    if not success:
+        log(f"Apply failed: {msg}", "FAIL")
+        all_passed = False
+    else:
+        log("Applied evaluation")
+
+    # Verify ss_planning got +0.01
+    after_planning = store.get_artifact("ss_planning")["data"]["confidence"]
+    expected_planning = round(baseline_planning + 0.01, 2)
+    if not assert_close(after_planning, expected_planning, 0.001, "ss_planning confidence (should increase)"):
+        all_passed = False
+
+    # Verify ss_source_verification is UNCHANGED (guardrail worked)
+    after_sv = store.get_artifact("ss_source_verification")["data"]["confidence"]
+    if not assert_eq(after_sv, baseline_sv, "ss_source_verification confidence (should be unchanged)"):
+        all_passed = False
+
+    # =========================================================
     # SUMMARY
     # =========================================================
     print("\n" + "="*60)
