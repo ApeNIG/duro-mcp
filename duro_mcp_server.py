@@ -44,6 +44,35 @@ MEMORY_DIR = Path(CONFIG["paths"]["memory_dir"])
 DB_PATH = MEMORY_DIR / "artifacts.db"
 artifact_store = ArtifactStore(MEMORY_DIR, DB_PATH)
 
+# Startup: ensure directories exist, seed core skills, and reindex
+# This prevents "file exists but not indexed" ghost artifacts
+def _startup_ensure_consistency():
+    """Ensure artifact directories exist, core skills are seeded, and index is synced."""
+    dirs_to_ensure = ["episodes", "evaluations", "skill_stats", "facts", "decisions", "logs"]
+    for dir_name in dirs_to_ensure:
+        (MEMORY_DIR / dir_name).mkdir(parents=True, exist_ok=True)
+
+    # Seed core skill stats (idempotent - skips if already exists)
+    core_skills = [
+        ("web_research", "Web Research"),
+        ("source_verification", "Source Verification"),
+        ("summarization", "Summarization"),
+        ("artifact_creation", "Artifact Creation"),
+        ("planning", "Planning"),
+    ]
+    for skill_id, name in core_skills:
+        created, _, _ = artifact_store.ensure_skill_stats(skill_id, name)
+        # Only log if created (first run)
+        if created:
+            print(f"[INFO] Seeded skill_stats: {skill_id}", file=sys.stderr)
+
+    # Reindex to ensure SQLite matches files on disk
+    success_count, error_count = artifact_store.reindex()
+    if error_count > 0:
+        print(f"[WARN] Startup reindex: {success_count} indexed, {error_count} errors", file=sys.stderr)
+
+_startup_ensure_consistency()
+
 # Initialize orchestrator
 orchestrator = Orchestrator(MEMORY_DIR, rules, skills, artifact_store)
 

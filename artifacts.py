@@ -439,16 +439,98 @@ class ArtifactStore:
         next_change: Optional[str] = None,
         tags: Optional[list[str]] = None,
         workflow: str = "manual",
-        sensitivity: str = "internal"
+        sensitivity: str = "internal",
+        auto_skill_updates: bool = True
     ) -> tuple[bool, str, str]:
         """
         Store an evaluation artifact for an episode.
+
+        Auto-generates skill_stats updates based on episode result and skills_used:
+        - success: +0.01 to each skill used
+        - partial: +0.005 to each skill used
+        - failed: -0.01 to each skill used
+
+        User-provided memory_updates are merged with auto-generated ones.
+        Guardrail: only skills listed in episode.links.skills_used can be auto-updated.
+
+        Set auto_skill_updates=False to disable auto-generation.
+
         Returns (success, artifact_id, file_path).
         """
         # Verify episode exists
         episode = self.get_artifact(episode_id)
         if not episode:
             return False, "", f"Episode '{episode_id}' not found"
+
+        episode_data = episode.get("data", {})
+        episode_result = episode_data.get("result")
+        skills_used = episode_data.get("links", {}).get("skills_used", [])
+
+        # Auto-generate skill updates based on episode result
+        auto_updates = {"reinforce": [], "decay": []}
+        if auto_skill_updates and skills_used:
+            # Determine delta based on result
+            if episode_result == "success":
+                delta = 0.01
+                update_type = "reinforce"
+            elif episode_result == "partial":
+                delta = 0.005
+                update_type = "reinforce"
+            elif episode_result == "failed":
+                delta = 0.01  # Will be negated for decay
+                update_type = "decay"
+            else:
+                # No result yet or unknown - skip auto updates
+                delta = None
+                update_type = None
+
+            if delta and update_type:
+                for skill_id in skills_used:
+                    # Ensure deterministic ID format
+                    artifact_id = f"ss_{skill_id}" if not skill_id.startswith("ss_") else skill_id
+                    # Ensure skill_stats exists (idempotent)
+                    skill_name = skill_id.replace("_", " ").title()
+                    self.ensure_skill_stats(skill_id, skill_name)
+
+                    update_item = {
+                        "type": "skill_stats",
+                        "id": artifact_id,
+                        "delta": delta if update_type == "reinforce" else -delta,
+                        "reason": f"auto: episode {episode_result}",
+                        "auto_generated": True
+                    }
+                    auto_updates[update_type].append(update_item)
+
+        # Merge user-provided updates with auto-generated ones
+        final_updates = {"reinforce": [], "decay": []}
+
+        # Add auto-generated updates first
+        final_updates["reinforce"].extend(auto_updates["reinforce"])
+        final_updates["decay"].extend(auto_updates["decay"])
+
+        # Merge user-provided updates (guardrail: filter to skills_used only for skill_stats)
+        if memory_updates:
+            for item in memory_updates.get("reinforce", []):
+                item_id = item.get("id") or item.get("artifact_id", "")
+                item_type = item.get("type", "")
+                # Guardrail: if it's a skill_stats update, verify it's in skills_used
+                if item_type == "skill_stats" or item_id.startswith("ss_"):
+                    skill_id = item_id.replace("ss_", "")
+                    if skill_id not in skills_used and item_id not in skills_used:
+                        # Skip - not in skills_used (guardrail)
+                        continue
+                final_updates["reinforce"].append(item)
+
+            for item in memory_updates.get("decay", []):
+                item_id = item.get("id") or item.get("artifact_id", "")
+                item_type = item.get("type", "")
+                # Guardrail: if it's a skill_stats update, verify it's in skills_used
+                if item_type == "skill_stats" or item_id.startswith("ss_"):
+                    skill_id = item_id.replace("ss_", "")
+                    if skill_id not in skills_used and item_id not in skills_used:
+                        # Skip - not in skills_used (guardrail)
+                        continue
+                final_updates["decay"].append(item)
 
         artifact_id = generate_id("evaluation")
         now = datetime.utcnow().isoformat() + "Z"
@@ -470,7 +552,7 @@ class ArtifactStore:
                 "episode_id": episode_id,
                 "rubric": rubric,
                 "grade": grade,
-                "memory_updates": memory_updates or {"reinforce": [], "decay": []},
+                "memory_updates": final_updates,
                 "applied": False,
                 "applied_at": None,
                 "next_change": next_change
@@ -533,6 +615,130 @@ class ArtifactStore:
 
         return self._store_artifact(artifact)
 
+    def ensure_skill_stats(
+        self,
+        skill_id: str,
+        name: str,
+        confidence: float = 0.5,
+        tags: Optional[list[str]] = None
+    ) -> tuple[bool, str, str]:
+        """
+        Ensure a skill stats artifact exists with a deterministic ID (ss_{skill_id}).
+        If it already exists, returns the existing artifact info.
+        If not, creates it with proper schema validation and indexing.
+
+        This is the preferred way to seed core skills - it's idempotent.
+        Returns (created, artifact_id, message).
+        """
+        deterministic_id = f"ss_{skill_id}"
+
+        # Check if already exists
+        existing = self.get_artifact(deterministic_id)
+        if existing:
+            return False, deterministic_id, "Already exists"
+
+        # Cap confidence to valid range
+        confidence = max(0.05, min(0.99, confidence))
+
+        artifact = {
+            "id": deterministic_id,
+            "type": "skill_stats",
+            "version": "1.0",
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "updated_at": None,
+            "sensitivity": "internal",
+            "tags": tags or ["core", skill_id, "seeded"],
+            "source": {
+                "workflow": "startup_seed",
+                "run_id": None,
+                "tool_trace_path": None
+            },
+            "data": {
+                "skill_id": skill_id,
+                "name": name,
+                "total_uses": 0,
+                "successes": 0,
+                "failures": 0,
+                "success_rate": 0.0,
+                "avg_duration_ms": None,
+                "last_used": None,
+                "last_outcome": None,
+                "confidence": confidence
+            }
+        }
+
+        success, artifact_id, path = self._store_artifact(artifact)
+        if success:
+            return True, artifact_id, f"Created at {path}"
+        return False, "", f"Failed to create: {path}"
+
+    def _normalize_memory_update_item(self, item: dict, is_reinforce: bool) -> dict:
+        """
+        Normalize a memory update item to support both payload formats.
+
+        New format: {type, id, delta}
+        Old format: {artifact_id, reason, delta?}
+
+        Infers type from ID prefix if missing:
+          - fact_ → fact
+          - decision_ → decision
+          - ss_ → skill_stats
+          - ep_ → episode
+          - eval_ → evaluation
+
+        Defaults delta to +0.01 (reinforce) or -0.01 (decay) if missing.
+
+        When normalizing legacy format, adds audit breadcrumb:
+          - normalized_from: "legacy"
+          - original_item: copy of the original item
+        """
+        normalized = {}
+
+        # Detect legacy format: has artifact_id instead of id, or missing type
+        is_legacy = "artifact_id" in item or ("id" not in item and "type" not in item)
+
+        # Handle id/artifact_id
+        artifact_id = item.get("id") or item.get("artifact_id")
+        normalized["id"] = artifact_id
+
+        # Handle type - infer from prefix if missing
+        artifact_type = item.get("type")
+        type_was_inferred = False
+        if not artifact_type and artifact_id:
+            type_was_inferred = True
+            if artifact_id.startswith("fact_"):
+                artifact_type = "fact"
+            elif artifact_id.startswith("decision_"):
+                artifact_type = "decision"
+            elif artifact_id.startswith("ss_"):
+                artifact_type = "skill_stats"
+            elif artifact_id.startswith("ep_"):
+                artifact_type = "episode"
+            elif artifact_id.startswith("eval_"):
+                artifact_type = "evaluation"
+            else:
+                # Assume skill_stats for unprefixed IDs (e.g., "planning")
+                artifact_type = "skill_stats"
+        normalized["type"] = artifact_type
+
+        # Handle delta - default based on reinforce/decay
+        delta = item.get("delta") or item.get("delta_confidence")
+        delta_was_defaulted = delta is None
+        if delta is None:
+            delta = 0.01 if is_reinforce else -0.01
+        normalized["delta"] = delta
+
+        # Preserve reason for auditability
+        if "reason" in item:
+            normalized["reason"] = item["reason"]
+
+        # Add audit breadcrumb for legacy format normalization
+        if is_legacy or type_was_inferred or delta_was_defaulted:
+            normalized["normalized_from"] = "legacy"
+            normalized["original_item"] = {k: v for k, v in item.items()}
+
+        return normalized
+
     def apply_evaluation(
         self,
         evaluation_id: str
@@ -546,6 +752,10 @@ class ArtifactStore:
         - Confidence deltas capped at ±0.02 per episode
         - Final confidence capped to [0.05, 0.99]
         - Only apply once per evaluation
+
+        Supports both payload formats:
+        - New: {type, id, delta}
+        - Old: {artifact_id, reason, delta?}
 
         Returns (success, message, applied_updates).
         """
@@ -566,23 +776,33 @@ class ArtifactStore:
         memory_updates = data.get("memory_updates", {})
         applied = {"reinforced": [], "decayed": [], "errors": []}
 
+        # Track normalized items for audit trail
+        normalized_reinforce = []
+        normalized_decay = []
+
         # Apply reinforcements
         for item in memory_updates.get("reinforce", []):
-            artifact_type = item.get("type")
-            artifact_id = item.get("id")
-            delta = item.get("delta", 0.01)
+            normalized = self._normalize_memory_update_item(item, is_reinforce=True)
+            normalized_reinforce.append(normalized)
+            artifact_type = normalized["type"]
+            artifact_id = normalized["id"]
+            delta = normalized["delta"]
+            reason = normalized.get("reason")
 
             # Cap delta
             delta = min(0.02, max(-0.02, delta))
 
             result = self._apply_confidence_delta(artifact_type, artifact_id, delta)
             if result["success"]:
-                applied["reinforced"].append({
+                record = {
                     "id": artifact_id,
                     "type": artifact_type,
                     "delta": delta,
                     "new_confidence": result["new_confidence"]
-                })
+                }
+                if reason:
+                    record["reason"] = reason
+                applied["reinforced"].append(record)
             else:
                 applied["errors"].append({
                     "id": artifact_id,
@@ -591,9 +811,12 @@ class ArtifactStore:
 
         # Apply decays
         for item in memory_updates.get("decay", []):
-            artifact_type = item.get("type")
-            artifact_id = item.get("id")
-            delta = item.get("delta_confidence", -0.01)
+            normalized = self._normalize_memory_update_item(item, is_reinforce=False)
+            normalized_decay.append(normalized)
+            artifact_type = normalized["type"]
+            artifact_id = normalized["id"]
+            delta = normalized["delta"]
+            reason = normalized.get("reason")
 
             # Ensure negative and cap
             if delta > 0:
@@ -602,21 +825,29 @@ class ArtifactStore:
 
             result = self._apply_confidence_delta(artifact_type, artifact_id, delta)
             if result["success"]:
-                applied["decayed"].append({
+                record = {
                     "id": artifact_id,
                     "type": artifact_type,
                     "delta": delta,
                     "new_confidence": result["new_confidence"]
-                })
+                }
+                if reason:
+                    record["reason"] = reason
+                applied["decayed"].append(record)
             else:
                 applied["errors"].append({
                     "id": artifact_id,
                     "error": result["error"]
                 })
 
-        # Mark evaluation as applied
+        # Mark evaluation as applied and store normalized items for audit trail
         data["applied"] = True
         data["applied_at"] = datetime.utcnow().isoformat() + "Z"
+        # Replace memory_updates with normalized versions (includes breadcrumbs)
+        data["memory_updates"] = {
+            "reinforce": normalized_reinforce,
+            "decay": normalized_decay
+        }
         evaluation["data"] = data
         evaluation["updated_at"] = data["applied_at"]
         self._update_artifact_file(evaluation)
