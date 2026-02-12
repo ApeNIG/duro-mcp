@@ -406,6 +406,18 @@ class ArtifactStore:
                 except Exception:
                     pass
 
+            # Hygiene rule: warn if closing with result but no skills_used
+            if "warnings" not in data or data["warnings"] is None:
+                data["warnings"] = []
+
+            links = data.get("links", {}) or {}
+            skills_used = links.get("skills_used", []) or []
+
+            if data.get("result") in ("success", "partial", "failed") and not skills_used:
+                warn = "skills_used missing: episode closed with result but no skills recorded"
+                if warn not in data["warnings"]:
+                    data["warnings"].append(warn)
+
         artifact["data"] = data
         artifact["updated_at"] = datetime.utcnow().isoformat() + "Z"
 
@@ -508,6 +520,17 @@ class ArtifactStore:
         final_updates["reinforce"].extend(auto_updates["reinforce"])
         final_updates["decay"].extend(auto_updates["decay"])
 
+        # Track guardrail blocks for visibility
+        guardrail = {"skipped": 0, "skipped_items": []}
+
+        def _guardrail_skip(item: dict, reason: str):
+            guardrail["skipped"] += 1
+            guardrail["skipped_items"].append({
+                "item_id": item.get("id") or item.get("artifact_id") or "",
+                "reason": reason,
+                "raw": item
+            })
+
         # Merge user-provided updates (guardrail: filter to skills_used only for skill_stats)
         if memory_updates:
             for item in memory_updates.get("reinforce", []):
@@ -517,7 +540,7 @@ class ArtifactStore:
                 if item_type == "skill_stats" or item_id.startswith("ss_"):
                     skill_id = item_id.replace("ss_", "")
                     if skill_id not in skills_used and item_id not in skills_used:
-                        # Skip - not in skills_used (guardrail)
+                        _guardrail_skip(item, "skill_stats update blocked: not in episode.links.skills_used")
                         continue
                 final_updates["reinforce"].append(item)
 
@@ -528,7 +551,7 @@ class ArtifactStore:
                 if item_type == "skill_stats" or item_id.startswith("ss_"):
                     skill_id = item_id.replace("ss_", "")
                     if skill_id not in skills_used and item_id not in skills_used:
-                        # Skip - not in skills_used (guardrail)
+                        _guardrail_skip(item, "skill_stats decay blocked: not in episode.links.skills_used")
                         continue
                 final_updates["decay"].append(item)
 
@@ -555,7 +578,12 @@ class ArtifactStore:
                 "memory_updates": final_updates,
                 "applied": False,
                 "applied_at": None,
-                "next_change": next_change
+                "next_change": next_change,
+                "guardrail": {
+                    "skipped_count": guardrail["skipped"],
+                    "skipped_items": guardrail["skipped_items"]
+                },
+                "breadcrumbs": [f"guardrail_skipped={guardrail['skipped']}"] if guardrail["skipped"] else []
             }
         }
 
