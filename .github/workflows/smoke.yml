@@ -1,0 +1,46 @@
+name: Smoke Test
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Create memory directory structure
+        run: |
+          mkdir -p ~/.agent/memory/{facts,decisions,skills,rules,logs,episodes,evaluations,skill_stats}
+
+      - name: Seed test skill stats
+        run: |
+          python -c "
+          from artifacts import ArtifactStore
+          from pathlib import Path
+          import os
+
+          store = ArtifactStore(
+              Path(os.path.expanduser('~/.agent/memory')),
+              Path(os.path.expanduser('~/.agent/memory/index.db'))
+          )
+
+          # Seed required skill stats
+          store.ensure_skill_stats('planning', 'Planning', confidence=0.5)
+          store.ensure_skill_stats('auto_test', 'Auto Test Skill', confidence=0.5)
+          store.ensure_skill_stats('source_verification', 'Source Verification', confidence=0.5)
+          store.reindex()
+          print('Seeded skill stats for smoke test')
+          "
+
+      - name: Run smoke test
+        run: python smoke_test.py
