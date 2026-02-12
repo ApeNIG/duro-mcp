@@ -1,0 +1,28 @@
+{
+  "name": "Duro MCP Server",
+  "version": "1.0.0",
+  "description": "Local AI agent system with persistent memory, skills, and rules",
+
+  "paths": {
+    "agent_root": "C:/Users/sibag/.agent",
+    "memory_dir": "C:/Users/sibag/.agent/memory",
+    "skills_dir": "C:/Users/sibag/.agent/skills",
+    "rules_dir": "C:/Users/sibag/.agent/rules",
+    "projects_dir": "C:/Users/sibag/.agent/projects",
+    "proposals_dir": "C:/Users/sibag/.agent/proposals"
+  },
+
+  "files": {
+    "soul": "soul.md",
+    "memory_core": "MEMORY.md",
+    "skills_index": "index.json",
+    "rules_index": "index.json",
+    "projects_registry": "registry.md"
+  },
+
+  "settings": {
+    "auto_save_memory": true,
+    "check_rules_on_task": true,
+    "log_skill_usage": true
+  }
+}
