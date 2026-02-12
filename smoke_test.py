@@ -378,6 +378,90 @@ def run_smoke_tests():
         all_passed = False
 
     # =========================================================
+    # TEST 5: Decision Outcomes - Validate and Link to Episode
+    # =========================================================
+    print("\n--- TEST 5: Decision Outcomes Validation ---\n")
+
+    # Create a decision with initial confidence
+    decision_id = f"dec_smoke_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    success, dec_id, _ = store.store_decision(
+        decision="Use async processing for smoke test batch jobs",
+        rationale="Async improves throughput without blocking the main thread",
+        context="smoke test decision outcomes",
+        alternatives=["sync processing", "thread pool"],
+        tags=["smoke-test", "decision-outcome"],
+        reversible=True,
+        sensitivity="internal"
+    )
+    if not success:
+        log(f"Failed to create decision: {dec_id}", "FAIL")
+        return False
+    log(f"Created decision: {dec_id}")
+
+    # Get initial confidence
+    dec_artifact = store.get_artifact(dec_id)
+    initial_conf = dec_artifact["data"].get("outcome", {}).get("confidence", 0.5)
+    log(f"Initial decision confidence: {initial_conf}")
+
+    # Create episode that uses this decision
+    success, ep_id5, _ = store.store_episode(
+        goal="Smoke test - decision validation",
+        plan=["Make decision", "Execute", "Validate outcome"],
+        tags=["smoke-test", "decision-outcome"],
+        context={"decision_under_test": dec_id}
+    )
+    if not success:
+        log(f"Failed to create episode: {ep_id5}", "FAIL")
+        return False
+    log(f"Created episode: {ep_id5}")
+
+    # Close episode with success
+    success, msg = store.update_episode(ep_id5, {
+        "status": "closed",
+        "result": "success",
+        "result_summary": "Decision validated - async processing worked well",
+        "links": {"skills_used": ["planning"], "decisions_created": [dec_id]}
+    })
+    if not success:
+        log(f"Failed to close episode: {msg}", "FAIL")
+        return False
+    log("Closed episode with success")
+
+    # Validate the decision with episode evidence
+    success, msg = store.validate_decision(
+        decision_id=dec_id,
+        status="validated",
+        episode_id=ep_id5,
+        result="success",
+        notes="Async processing confirmed to improve throughput in smoke test"
+    )
+    if not success:
+        log(f"Failed to validate decision: {msg}", "FAIL")
+        all_passed = False
+    else:
+        log(f"Validated decision: {msg}")
+
+    # Verify confidence increased (validated = +0.1)
+    dec_after = store.get_artifact(dec_id)
+    final_conf = dec_after["data"]["outcome"]["confidence"]
+    expected_conf5 = min(0.99, initial_conf + 0.1)
+
+    if not assert_close(final_conf, expected_conf5, 0.01, "Decision confidence after validation"):
+        all_passed = False
+
+    # Verify outcome status is now "validated"
+    if not assert_eq(dec_after["data"]["outcome"]["status"], "validated", "Decision outcome status"):
+        all_passed = False
+
+    # Verify episode is linked
+    episodes_used = dec_after["data"].get("episodes_used", [])
+    if ep_id5 in episodes_used:
+        log(f"Episode linked to decision: {ep_id5}", "PASS")
+    else:
+        log(f"Episode NOT linked to decision", "FAIL")
+        all_passed = False
+
+    # =========================================================
     # SUMMARY
     # =========================================================
     print("\n" + "="*60)

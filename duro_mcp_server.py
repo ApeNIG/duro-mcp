@@ -403,6 +403,56 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="duro_validate_decision",
+            description="Validate or reverse a decision based on evidence. Use this to record whether a decision worked out.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "decision_id": {
+                        "type": "string",
+                        "description": "The decision ID to validate"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["validated", "reversed", "superseded"],
+                        "description": "New status: validated (worked), reversed (didn't work), superseded (replaced)"
+                    },
+                    "episode_id": {
+                        "type": "string",
+                        "description": "Optional episode ID that provides evidence"
+                    },
+                    "result": {
+                        "type": "string",
+                        "enum": ["success", "partial", "failed"],
+                        "description": "Episode result as evidence"
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Additional context about the evidence"
+                    }
+                },
+                "required": ["decision_id", "status"]
+            }
+        ),
+        Tool(
+            name="duro_link_decision",
+            description="Link a decision to an episode where it was used/tested.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "decision_id": {
+                        "type": "string",
+                        "description": "The decision ID"
+                    },
+                    "episode_id": {
+                        "type": "string",
+                        "description": "The episode ID where this decision was applied"
+                    }
+                },
+                "required": ["decision_id", "episode_id"]
+            }
+        ),
+        Tool(
             name="duro_query_memory",
             description="Query artifacts from memory. SQLite-backed fast search.",
             inputSchema={
@@ -1077,6 +1127,37 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 text = f"Decision stored successfully.\n- ID: {artifact_id}\n- Path: {path}"
             else:
                 text = f"Failed to store decision: {path}"
+            return [TextContent(type="text", text=text)]
+
+        elif name == "duro_validate_decision":
+            success, message = artifact_store.validate_decision(
+                decision_id=arguments["decision_id"],
+                status=arguments["status"],
+                episode_id=arguments.get("episode_id"),
+                result=arguments.get("result"),
+                notes=arguments.get("notes")
+            )
+            if success:
+                # Get updated decision to show new confidence
+                decision = artifact_store.get_artifact(arguments["decision_id"])
+                confidence = decision["data"]["outcome"]["confidence"] if decision else "?"
+                status_icon = {"validated": "✓", "reversed": "✗", "superseded": "→"}.get(arguments["status"], "?")
+                text = f"Decision validated.\n- ID: `{arguments['decision_id']}`\n- Status: {status_icon} {arguments['status']}\n- Confidence: {confidence}"
+                if arguments.get("episode_id"):
+                    text += f"\n- Evidence: episode `{arguments['episode_id']}`"
+            else:
+                text = f"Failed to validate decision: {message}"
+            return [TextContent(type="text", text=text)]
+
+        elif name == "duro_link_decision":
+            success, message = artifact_store.link_decision_to_episode(
+                decision_id=arguments["decision_id"],
+                episode_id=arguments["episode_id"]
+            )
+            if success:
+                text = f"Decision linked to episode.\n- Decision: `{arguments['decision_id']}`\n- Episode: `{arguments['episode_id']}`"
+            else:
+                text = f"Failed to link decision: {message}"
             return [TextContent(type="text", text=text)]
 
         elif name == "duro_query_memory":

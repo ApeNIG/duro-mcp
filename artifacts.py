@@ -251,11 +251,140 @@ class ArtifactStore:
                 "alternatives": alternatives or [],
                 "context": context,
                 "reversible": reversible,
-                "outcome": None
+                "outcome": {
+                    "status": "unverified",
+                    "verified_at": None,
+                    "evidence": [],
+                    "confidence": 0.5
+                },
+                "episodes_used": []
             }
         }
 
         return self._store_artifact(artifact)
+
+    def validate_decision(
+        self,
+        decision_id: str,
+        status: str,
+        episode_id: Optional[str] = None,
+        result: Optional[str] = None,
+        notes: Optional[str] = None
+    ) -> tuple[bool, str]:
+        """
+        Validate or reverse a decision based on evidence.
+
+        Args:
+            decision_id: The decision to validate
+            status: New status - "validated", "reversed", or "superseded"
+            episode_id: Optional episode that provides evidence
+            result: Episode result - "success", "partial", or "failed"
+            notes: Additional context about the evidence
+
+        Returns (success, message).
+        """
+        # Get decision
+        artifact = self.get_artifact(decision_id)
+        if not artifact:
+            return False, f"Decision '{decision_id}' not found"
+
+        if artifact.get("type") != "decision":
+            return False, f"Artifact '{decision_id}' is not a decision"
+
+        # Validate status
+        valid_statuses = ["validated", "reversed", "superseded"]
+        if status not in valid_statuses:
+            return False, f"Invalid status '{status}'. Must be one of: {valid_statuses}"
+
+        data = artifact["data"]
+
+        # Ensure outcome structure exists
+        if "outcome" not in data or data["outcome"] is None:
+            data["outcome"] = {
+                "status": "unverified",
+                "verified_at": None,
+                "evidence": [],
+                "confidence": 0.5
+            }
+        elif isinstance(data["outcome"], str):
+            # Convert old string format
+            old_status = data["outcome"]
+            data["outcome"] = {
+                "status": old_status if old_status in valid_statuses + ["unverified"] else "unverified",
+                "verified_at": None,
+                "evidence": [],
+                "confidence": 0.5
+            }
+
+        # Update status
+        now = datetime.utcnow().isoformat() + "Z"
+        data["outcome"]["status"] = status
+        data["outcome"]["verified_at"] = now
+
+        # Add evidence if provided
+        if episode_id:
+            evidence_entry = {"episode_id": episode_id}
+            if result:
+                evidence_entry["result"] = result
+            if notes:
+                evidence_entry["notes"] = notes
+            data["outcome"]["evidence"].append(evidence_entry)
+
+            # Also track in episodes_used
+            if "episodes_used" not in data:
+                data["episodes_used"] = []
+            if episode_id not in data["episodes_used"]:
+                data["episodes_used"].append(episode_id)
+
+        # Adjust confidence based on status
+        current_conf = data["outcome"].get("confidence", 0.5)
+        if status == "validated":
+            # Boost confidence (capped at 0.99)
+            new_conf = min(0.99, current_conf + 0.1)
+        elif status == "reversed":
+            # Drop confidence significantly
+            new_conf = max(0.05, current_conf - 0.2)
+        elif status == "superseded":
+            # Slight drop - decision was replaced, not wrong
+            new_conf = max(0.05, current_conf - 0.05)
+        else:
+            new_conf = current_conf
+        data["outcome"]["confidence"] = round(new_conf, 2)
+
+        artifact["data"] = data
+        artifact["updated_at"] = now
+
+        return self._update_artifact_file(artifact)
+
+    def link_decision_to_episode(
+        self,
+        decision_id: str,
+        episode_id: str
+    ) -> tuple[bool, str]:
+        """
+        Link a decision to an episode where it was used.
+        Returns (success, message).
+        """
+        # Get decision
+        artifact = self.get_artifact(decision_id)
+        if not artifact:
+            return False, f"Decision '{decision_id}' not found"
+
+        if artifact.get("type") != "decision":
+            return False, f"Artifact '{decision_id}' is not a decision"
+
+        data = artifact["data"]
+
+        # Add to episodes_used
+        if "episodes_used" not in data:
+            data["episodes_used"] = []
+        if episode_id not in data["episodes_used"]:
+            data["episodes_used"].append(episode_id)
+
+        artifact["data"] = data
+        artifact["updated_at"] = datetime.utcnow().isoformat() + "Z"
+
+        return self._update_artifact_file(artifact)
 
     def store_log(
         self,
@@ -917,8 +1046,13 @@ class ArtifactStore:
         elif artifact_type == "skill_stats":
             current = data.get("confidence", 0.5)
         elif artifact_type == "decision":
-            # Decisions don't have confidence, skip
-            return {"success": True, "new_confidence": None, "error": None}
+            # Decisions have confidence in outcome object
+            outcome = data.get("outcome", {})
+            if isinstance(outcome, str):
+                # Old format - convert
+                outcome = {"status": "unverified", "verified_at": None, "evidence": [], "confidence": 0.5}
+                data["outcome"] = outcome
+            current = outcome.get("confidence", 0.5)
         else:
             return {"success": False, "error": f"Unknown artifact type for confidence: {artifact_type}"}
 
@@ -933,6 +1067,8 @@ class ArtifactStore:
             data["reinforcement_count"] = data.get("reinforcement_count", 0) + (1 if delta > 0 else 0)
         elif artifact_type == "skill_stats":
             data["confidence"] = new_confidence
+        elif artifact_type == "decision":
+            data["outcome"]["confidence"] = new_confidence
 
         artifact["data"] = data
         artifact["updated_at"] = datetime.utcnow().isoformat() + "Z"

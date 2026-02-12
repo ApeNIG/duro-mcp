@@ -133,8 +133,43 @@ DECISION_DATA_SCHEMA = {
             "description": "Whether decision can be undone"
         },
         "outcome": {
-            "type": ["string", "null"],
-            "description": "Result of the decision (filled later)"
+            "type": "object",
+            "description": "Decision outcome tracking",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["unverified", "validated", "reversed", "superseded"],
+                    "description": "Current status of the decision"
+                },
+                "verified_at": {
+                    "type": ["string", "null"],
+                    "format": "date-time",
+                    "description": "When the decision was validated/reversed"
+                },
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "episode_id": {"type": "string"},
+                            "result": {"type": "string", "enum": ["success", "partial", "failed"]},
+                            "notes": {"type": "string"}
+                        }
+                    },
+                    "description": "Episodes that tested this decision"
+                },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0.05,
+                    "maximum": 0.99,
+                    "description": "Confidence in this decision (can be reinforced/decayed)"
+                }
+            }
+        },
+        "episodes_used": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Episode IDs where this decision was applied"
         }
     }
 }
