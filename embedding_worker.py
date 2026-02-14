@@ -20,7 +20,7 @@ from pathlib import Path
 from time_utils import utc_now, utc_now_iso
 from typing import Optional, Callable
 
-from embeddings import artifact_to_text, should_embed, compute_content_hash
+from embeddings import artifact_to_text, should_embed, compute_content_hash, embed_text, is_embedding_available
 
 
 class EmbeddingQueue:
@@ -180,11 +180,16 @@ class EmbeddingWorker:
         # For Phase 1A, just record that we processed it
         return True
 
-    def _generate_placeholder_vector(self, text: str) -> list[float]:
+    def _generate_embedding(self, text: str) -> list[float]:
         """
-        Generate placeholder vector for Phase 1A testing.
-        Returns list of 384 zeros (matching BGE-small dimensions).
+        Generate embedding vector using FastEmbed.
+        Falls back to zeros if embedding unavailable.
         """
+        if is_embedding_available():
+            embedding = embed_text(text)
+            if embedding:
+                return embedding
+        # Fallback to zeros if embedding fails
         return [0.0] * 384
 
     def process_queue(self, batch_size: int = 10) -> dict:
@@ -227,7 +232,7 @@ class EmbeddingWorker:
                     continue
 
                 # Generate embedding (placeholder in Phase 1A)
-                vector = self._generate_placeholder_vector(text)
+                vector = self._generate_embedding(text)
 
                 # Store embedding via callback
                 success = self.embedding_callback(artifact_id, text, vector)

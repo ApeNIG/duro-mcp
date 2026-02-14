@@ -57,13 +57,25 @@ def up(db_path: str) -> dict:
                 result["message"] = "Migration already applied"
                 return result
 
-        # Also check if FTS table exists (migration may have been applied before runner existed)
+        # Check if FTS table exists (migration may have been applied before runner existed)
         cursor = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='artifact_fts'"
         )
-        if cursor.fetchone():
-            result["success"] = True
+        fts_exists = cursor.fetchone() is not None
+        if fts_exists:
             result["fts5_created"] = True
+
+        # Check if vector table exists
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='artifact_vectors'"
+        )
+        vec_exists = cursor.fetchone() is not None
+        if vec_exists:
+            result["vec_created"] = True
+
+        # If both exist, migration is complete
+        if fts_exists and vec_exists:
+            result["success"] = True
             result["message"] = "Migration already applied (tables exist)"
             return result
 

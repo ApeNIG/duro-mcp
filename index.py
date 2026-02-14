@@ -716,14 +716,14 @@ class ArtifactIndex:
                 ))
 
                 # Store embedding vector using sqlite-vec's serialize format
+                # Note: vec0 virtual tables don't support UPSERT, so delete first
                 import sqlite_vec
                 vec_bytes = sqlite_vec.serialize_float32(embedding)
 
+                conn.execute("DELETE FROM artifact_vectors WHERE artifact_id = ?", (artifact_id,))
                 conn.execute("""
                     INSERT INTO artifact_vectors (artifact_id, embedding)
                     VALUES (?, ?)
-                    ON CONFLICT(artifact_id) DO UPDATE SET
-                        embedding = excluded.embedding
                 """, (artifact_id, vec_bytes))
 
                 conn.commit()
