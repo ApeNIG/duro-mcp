@@ -53,7 +53,7 @@ def ensure_migrations_applied():
         from migrations import get_pending_migrations, run_all_pending
 
         # Log migrations dir for debugging wrong-cwd issues
-        migration_files = list(MIGRATIONS_DIR.glob("m*.py"))
+        migration_files = list(MIGRATIONS_DIR.glob("m[0-9][0-9][0-9]_*.py"))
         log(f"Migrations dir: {MIGRATIONS_DIR} ({len(migration_files)} files)")
 
         pending = get_pending_migrations(MIGRATIONS_DIR, str(DEFAULT_DB_PATH))
@@ -64,8 +64,8 @@ def ensure_migrations_applied():
         pending_ids = [m["migration_id"] for m in pending]
 
         if not auto_apply:
-            # Strict mode: fail with clear instructions
-            return False, f"Pending migrations: {pending_ids}. Run: python -m migrations.runner {DEFAULT_DB_PATH}"
+            # Strict mode: fail with clear instructions (exact command)
+            return False, f"Pending migrations: {pending_ids}. Run: python -m migrations.runner \"{DEFAULT_DB_PATH}\" up"
 
         log(f"Pending migrations detected: {pending_ids}")
         log("Auto-applying migrations...")

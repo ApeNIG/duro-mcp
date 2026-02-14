@@ -77,7 +77,7 @@ def get_pending_migrations(migrations_dir: Path, db_path: str) -> list[dict]:
     applied = {m["migration_id"] for m in get_applied_migrations(db_path)}
 
     pending = []
-    for migration_file in sorted(migrations_dir.glob("m*.py")):
+    for migration_file in sorted(migrations_dir.glob("m[0-9][0-9][0-9]_*.py")):
         module = _load_migration(migration_file)
         migration_id = getattr(module, "MIGRATION_ID", migration_file.stem)
 
@@ -249,7 +249,7 @@ def get_status(migrations_dir: Path, db_path: str) -> dict:
     applied_map = {m["migration_id"]: m["checksum"] for m in applied}
     modified = []
 
-    for migration_file in migrations_dir.glob("m*.py"):
+    for migration_file in migrations_dir.glob("m[0-9][0-9][0-9]_*.py"):
         module = _load_migration(migration_file)
         migration_id = getattr(module, "MIGRATION_ID", migration_file.stem)
 
