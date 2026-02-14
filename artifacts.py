@@ -597,6 +597,90 @@ class ArtifactStore:
 
         return self._update_artifact_file(artifact)
 
+    def get_active_decisions(
+        self,
+        limit: int = 5,
+        max_age_days: int = 7,
+        min_confidence: float = 0.5
+    ) -> list[dict]:
+        """
+        Get recently active decisions for lean context loading.
+
+        Active = recently updated + has some validation signal.
+
+        Args:
+            limit: Max decisions to return (default 5)
+            max_age_days: Only include decisions updated within N days (default 7)
+            min_confidence: Minimum outcome.confidence threshold (default 0.5)
+
+        Returns:
+            List of decision summaries sorted by updated_at DESC:
+            [
+                {
+                    "id": "decision_...",
+                    "decision": "Use Redis for caching",
+                    "confidence": 0.7,
+                    "status": "validated",
+                    "updated_at": "2026-02-14T10:00:00Z",
+                    "age_hours": 2.5
+                },
+                ...
+            ]
+        """
+        from datetime import timedelta
+
+        cutoff = utc_now() - timedelta(days=max_age_days)
+        cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+
+        # Query all decisions
+        entries = self.index.query(artifact_type="decision", limit=200)
+
+        active = []
+        now = utc_now()
+
+        for entry in entries:
+            # Load full artifact to check outcome.confidence
+            artifact = self.get_artifact(entry["id"])
+            if not artifact:
+                continue
+
+            data = artifact.get("data", {})
+            outcome = data.get("outcome")
+
+            # Handle missing/None outcome or old string format
+            if outcome is None or isinstance(outcome, str):
+                continue  # Skip - no confidence field
+
+            confidence = outcome.get("confidence", 0.5)
+            if confidence < min_confidence:
+                continue
+
+            # Check updated_at (fall back to created_at)
+            updated_at = artifact.get("updated_at") or artifact.get("created_at", "")
+            if not updated_at or updated_at < cutoff_iso:
+                continue
+
+            # Calculate age
+            try:
+                updated_dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                age_hours = round((now - updated_dt).total_seconds() / 3600, 1)
+            except Exception:
+                age_hours = None
+
+            active.append({
+                "id": artifact["id"],
+                "decision": data.get("decision", "")[:100],  # Truncate long decisions
+                "confidence": confidence,
+                "status": outcome.get("status", "unverified"),
+                "updated_at": updated_at,
+                "age_hours": age_hours
+            })
+
+        # Sort by updated_at DESC
+        active.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+
+        return active[:limit]
+
     def supersede_fact(
         self,
         old_fact_id: str,

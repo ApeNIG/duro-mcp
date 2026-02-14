@@ -354,3 +354,109 @@ class DuroMemory:
                     break
 
         return results
+
+    # =========================================================
+    # Lean Context Loading Helpers
+    # =========================================================
+
+    def load_today_tasks_only(self, max_tasks: int = 15) -> str:
+        """
+        Extract only task completions from today's log.
+        Skips learnings, session notes, failures.
+        Returns formatted string capped to max_tasks.
+        """
+        today_content = self.load_today_memory()
+        if not today_content:
+            return ""
+
+        tasks = []
+        lines = today_content.split('\n')
+        in_task_block = False
+        current_task = {}
+
+        for line in lines:
+            if '### [' in line and 'Task Completed' in line:
+                in_task_block = True
+                # Extract time from ### [HH:MM] Task Completed
+                match = re.search(r'\[(\d{2}:\d{2})\]', line)
+                current_task = {'time': match.group(1) if match else '??:??'}
+            elif in_task_block:
+                if '**Task:**' in line:
+                    current_task['task'] = line.replace('**Task:**', '').strip()
+                elif '**Outcome:**' in line:
+                    outcome = line.replace('**Outcome:**', '').strip()
+                    # Truncate long outcomes
+                    if len(outcome) > 80:
+                        outcome = outcome[:77] + "..."
+                    current_task['outcome'] = outcome
+                    tasks.append(current_task)
+                    in_task_block = False
+                    current_task = {}
+
+        if not tasks:
+            return ""
+
+        # Take most recent tasks (at end of list)
+        tasks = tasks[-max_tasks:]
+
+        # Format output
+        lines_out = ["## Today's Tasks (completed today)"]
+        for t in tasks:
+            lines_out.append(f"- [{t['time']}] {t.get('task', 'Task')} → {t.get('outcome', 'Done')}")
+
+        return '\n'.join(lines_out)
+
+    def load_core_trimmed(self, max_chars: int = 2000) -> str:
+        """
+        Load core memory but only specific sections.
+        Includes: User Preferences, Important Context
+        Skips: Learned Patterns (queryable via semantic search)
+        Falls back to truncated full if parsing fails.
+        """
+        full_core = self.load_core_memory()
+        if not full_core:
+            return ""
+
+        # Try to extract specific sections by ## headings
+        sections_to_include = ["User Preferences", "Important Context"]
+        extracted = []
+
+        # Split by ## headings
+        parts = re.split(r'^(## .+)$', full_core, flags=re.MULTILINE)
+
+        current_heading = None
+        for part in parts:
+            if part.startswith('## '):
+                current_heading = part.replace('## ', '').strip()
+            elif current_heading in sections_to_include:
+                extracted.append(f"## {current_heading}\n{part.strip()}")
+
+        if extracted:
+            result = '\n\n'.join(extracted)
+            # Apply char cap
+            if len(result) > max_chars:
+                result = result[:max_chars - 3] + "..."
+            return result
+
+        # Fallback: truncate full core memory
+        if len(full_core) > max_chars:
+            return full_core[:max_chars - 3] + "..."
+        return full_core
+
+    def load_recent_summary(self, days_back: int = 1, max_chars: int = 800) -> str:
+        """
+        Load summary from N days back, capped to max_chars.
+        Provides continuity without bulk.
+        """
+        target_date = datetime.now() - timedelta(days=days_back)
+        date_str = target_date.strftime("%Y-%m-%d")
+
+        summary = self.load_day_summary(date_str)
+        if not summary:
+            return ""
+
+        # Apply char cap
+        if len(summary) > max_chars:
+            summary = summary[:max_chars - 3] + "..."
+
+        return summary

@@ -359,6 +359,12 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Number of days of recent memory to load",
                         "default": 3
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["full", "lean", "minimal"],
+                        "default": "full",
+                        "description": "Context verbosity: full (all detail), lean (tasks+decisions only), minimal (soul+core only)"
                     }
                 }
             }
@@ -1470,48 +1476,113 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         if name == "duro_load_context":
             include_soul = arguments.get("include_soul", True)
             recent_days = arguments.get("recent_days", 3)
+            mode = arguments.get("mode", "full")  # full, lean, minimal
 
             # Auto-compress old logs before loading (keeps context lean)
             compress_results = memory.compress_old_logs()
 
             result = []
+            metrics = {"mode": mode, "chars": 0, "tasks": 0, "decisions": 0, "summaries": 0}
 
-            # Soul (truncated if very long)
+            # === SOUL ===
+            # All modes include soul (capped)
             if include_soul:
                 soul = memory.load_soul()
                 if soul:
-                    if len(soul) > 2000:
-                        result.append(f"## Soul Configuration\n{soul[:2000]}...")
-                    else:
-                        result.append(f"## Soul Configuration\n{soul}")
+                    # Cap to 2500 chars for all modes
+                    if len(soul) > 2500:
+                        soul = soul[:2497] + "..."
+                    result.append(f"## Soul Configuration\n{soul}")
+                    metrics["chars"] += len(soul)
 
-            # Core memory
-            core = memory.load_core_memory()
-            if core:
-                result.append(f"## Core Memory\n{core}")
+            # === CORE MEMORY ===
+            if mode == "full":
+                # Full core memory
+                core = memory.load_core_memory()
+                if core:
+                    result.append(f"## Core Memory\n{core}")
+                    metrics["chars"] += len(core)
+            else:
+                # Lean/minimal: trimmed core (2000 chars, specific sections)
+                core = memory.load_core_trimmed(max_chars=2000)
+                if core:
+                    result.append(f"## Core Memory (trimmed: User Preferences, Important Context)\n{core}")
+                    metrics["chars"] += len(core)
 
-            # Today's memory (full raw log)
-            today = memory.load_today_memory()
-            if today:
-                result.append(f"## Today's Memory\n{today}")
+            # === TODAY'S CONTENT ===
+            if mode == "full":
+                # Full raw log
+                today = memory.load_today_memory()
+                if today:
+                    result.append(f"## Today's Memory\n{today}")
+                    metrics["chars"] += len(today)
+            elif mode == "lean":
+                # Tasks only (max 15)
+                tasks = memory.load_today_tasks_only(max_tasks=15)
+                if tasks:
+                    result.append(tasks)
+                    # Count tasks from the output
+                    task_count = tasks.count("\n- [")
+                    metrics["tasks"] = task_count
+                    metrics["chars"] += len(tasks)
+            # minimal: no today content
 
-            # Recent memory (hybrid: summaries for old days)
-            recent = memory.load_recent_memory(days=recent_days, use_summaries=True)
-            today_date = datetime.now().strftime("%Y-%m-%d")
+            # === ACTIVE DECISIONS (lean only) ===
+            if mode == "lean":
+                active_decisions = artifact_store.get_active_decisions(limit=5, max_age_days=7, min_confidence=0.5)
+                if active_decisions:
+                    decisions_lines = ["## Active Decisions (updated within 7 days, confidence >= 0.5)"]
+                    for d in active_decisions:
+                        status_badge = f"[{d['status']}]" if d.get('status') else ""
+                        age_str = f"{d['age_hours']}h ago" if d.get('age_hours') else ""
+                        decisions_lines.append(
+                            f"- {d['decision'][:80]} (conf: {d['confidence']:.2f}, {status_badge} {age_str})"
+                        )
+                    decisions_section = "\n".join(decisions_lines)
+                    result.append(decisions_section)
+                    metrics["decisions"] = len(active_decisions)
+                    metrics["chars"] += len(decisions_section)
 
-            # Filter out today (already shown above)
-            older_days = {k: v for k, v in recent.items() if k != today_date}
-            if older_days:
-                result.append("## Recent Memory (Summaries)")
-                for date, content in list(older_days.items()):
-                    result.append(f"### {date}\n{content}")
+            # === RECENT SUMMARIES ===
+            if mode == "full":
+                # All recent summaries
+                recent = memory.load_recent_memory(days=recent_days, use_summaries=True)
+                today_date = datetime.now().strftime("%Y-%m-%d")
+                older_days = {k: v for k, v in recent.items() if k != today_date}
+                if older_days:
+                    result.append("## Recent Memory (Summaries)")
+                    for date, content in list(older_days.items()):
+                        result.append(f"### {date}\n{content}")
+                        metrics["chars"] += len(content)
+                    metrics["summaries"] = len(older_days)
+            elif mode == "lean":
+                # Just yesterday's summary (1 day back, 800 chars)
+                summary = memory.load_recent_summary(days_back=1, max_chars=800)
+                if summary:
+                    result.append(f"## Yesterday's Summary (continuity)\n{summary}")
+                    metrics["summaries"] = 1
+                    metrics["chars"] += len(summary)
+            # minimal: no summaries
 
-            # Add stats footer
-            stats = memory.get_memory_stats()
+            # === FOOTER ===
+            # Context footer with metrics
+            footer_parts = [f"Context: {mode}"]
+            footer_parts.append(f"{metrics['chars']} chars")
+            if metrics["tasks"]:
+                footer_parts.append(f"{metrics['tasks']} tasks")
+            if metrics["decisions"]:
+                footer_parts.append(f"{metrics['decisions']} decisions")
+            if metrics["summaries"]:
+                footer_parts.append(f"{metrics['summaries']} summary" if metrics["summaries"] == 1 else f"{metrics['summaries']} summaries")
+
+            footer = "\n---\n" + " | ".join(footer_parts)
+            result.append(footer)
+
+            # Add compression note if applicable
             if compress_results:
                 compressed_dates = [d for d, s in compress_results.items() if "compressed" in s]
                 if compressed_dates:
-                    result.append(f"\n*Auto-compressed {len(compressed_dates)} old log(s). Use `duro_query_archive` to access full details.*")
+                    result.append(f"*Auto-compressed {len(compressed_dates)} old log(s). Use `duro_query_archive` to access full details.*")
 
             text = "\n\n".join(result) if result else "No context loaded."
             return [TextContent(type="text", text=text)]
