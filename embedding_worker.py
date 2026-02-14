@@ -14,8 +14,18 @@ The pending/ directory is file-based for crash resilience.
 import json
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _utc_now() -> datetime:
+    """Return current UTC time as timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
+
+def _utc_now_iso() -> str:
+    """Return current UTC time as ISO string with Z suffix."""
+    return _utc_now().isoformat().replace("+00:00", "Z")
 from typing import Optional, Callable
 
 from embeddings import artifact_to_text, should_embed, compute_content_hash
@@ -47,14 +57,14 @@ class EmbeddingQueue:
         """
         try:
             # Filename format: {priority}_{timestamp}_{artifact_id}.pending
-            timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            timestamp = _utc_now().strftime("%Y%m%d%H%M%S")
             filename = f"{priority:03d}_{timestamp}_{artifact_id}.pending"
             pending_file = self.pending_dir / filename
 
             # Write minimal metadata
             metadata = {
                 "artifact_id": artifact_id,
-                "queued_at": datetime.utcnow().isoformat() + "Z",
+                "queued_at": _utc_now_iso(),
                 "priority": priority
             }
             pending_file.write_text(json.dumps(metadata), encoding='utf-8')
@@ -111,7 +121,7 @@ class EmbeddingQueue:
 
             # Read current metadata and add error info
             metadata = json.loads(pending_file.read_text(encoding='utf-8'))
-            metadata["failed_at"] = datetime.utcnow().isoformat() + "Z"
+            metadata["failed_at"] = _utc_now_iso()
             metadata["error"] = error
 
             # Write to failed directory
@@ -244,7 +254,7 @@ class EmbeddingWorker:
                 self.stats["failed"] += 1
 
         results["remaining"] = self.queue.get_pending_count()
-        self.stats["last_run"] = datetime.utcnow().isoformat() + "Z"
+        self.stats["last_run"] = _utc_now_iso()
         return results
 
     def get_stats(self) -> dict:

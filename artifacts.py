@@ -11,8 +11,18 @@ import string
 import sys
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _utc_now() -> datetime:
+    """Return current UTC time as timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
+
+def _utc_now_iso() -> str:
+    """Return current UTC time as ISO string with Z suffix."""
+    return _utc_now().isoformat().replace("+00:00", "Z")
 from typing import Any, Optional
 
 from schemas import validate_artifact, TYPE_DIRECTORIES, apply_backward_compat_defaults
@@ -78,7 +88,7 @@ def file_lock(file_handle, timeout_ms: int = 5000):
 
 def generate_id(artifact_type: str) -> str:
     """Generate a unique artifact ID."""
-    now = datetime.utcnow()
+    now = _utc_now()
     date_part = now.strftime("%Y%m%d")
     time_part = now.strftime("%H%M%S")
     random_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
@@ -244,14 +254,14 @@ class ArtifactStore:
         type_backup_dir.mkdir(parents=True, exist_ok=True)
 
         # Generate backup filename with timestamp
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = _utc_now().strftime("%Y%m%d_%H%M%S")
         backup_filename = f"{timestamp}_{artifact_id}.json"
         backup_path = type_backup_dir / backup_filename
 
         # Create backup envelope with metadata
         backup_envelope = {
             "backup_meta": {
-                "backed_up_at": datetime.utcnow().isoformat() + "Z",
+                "backed_up_at": _utc_now_iso(),
                 "operation": operation,
                 "original_path": str(file_path),
                 "original_hash": compute_hash(content)
@@ -402,7 +412,7 @@ class ArtifactStore:
             "id": artifact_id,
             "type": "fact",
             "version": "1.1",  # Updated version for new fields
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": _utc_now_iso(),
             "updated_at": None,
             "sensitivity": sensitivity,
             "tags": tags or [],
@@ -445,7 +455,7 @@ class ArtifactStore:
             "id": artifact_id,
             "type": "decision",
             "version": "1.0",
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": _utc_now_iso(),
             "updated_at": None,
             "sensitivity": sensitivity,
             "tags": tags or [],
@@ -526,7 +536,7 @@ class ArtifactStore:
             }
 
         # Update status
-        now = datetime.utcnow().isoformat() + "Z"
+        now = _utc_now_iso()
         data["outcome"]["status"] = status
         data["outcome"]["verified_at"] = now
 
@@ -591,7 +601,7 @@ class ArtifactStore:
             data["episodes_used"].append(episode_id)
 
         artifact["data"] = data
-        artifact["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        artifact["updated_at"] = _utc_now_iso()
 
         return self._update_artifact_file(artifact)
 
@@ -618,7 +628,7 @@ class ArtifactStore:
             "id": artifact_id,
             "type": "log",
             "version": "1.0",
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": _utc_now_iso(),
             "updated_at": None,
             "sensitivity": sensitivity,
             "tags": tags or [],
@@ -655,7 +665,7 @@ class ArtifactStore:
         Returns (success, artifact_id, file_path).
         """
         artifact_id = generate_id("episode")
-        now = datetime.utcnow().isoformat() + "Z"
+        now = _utc_now_iso()
 
         artifact = {
             "id": artifact_id,
@@ -715,7 +725,7 @@ class ArtifactStore:
         # Append actions if provided
         if "action" in updates:
             action = updates["action"]
-            action["timestamp"] = datetime.utcnow().isoformat() + "Z"
+            action["timestamp"] = _utc_now_iso()
             data["actions"].append(action)
 
         # Update other fields
@@ -734,7 +744,7 @@ class ArtifactStore:
 
         # If closing the episode
         if updates.get("status") == "closed":
-            data["closed_at"] = datetime.utcnow().isoformat() + "Z"
+            data["closed_at"] = _utc_now_iso()
             # Calculate duration
             if data.get("started_at"):
                 try:
@@ -757,7 +767,7 @@ class ArtifactStore:
                     data["warnings"].append(warn)
 
         artifact["data"] = data
-        artifact["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        artifact["updated_at"] = _utc_now_iso()
 
         # Rewrite the file
         return self._update_artifact_file(artifact)
@@ -894,7 +904,7 @@ class ArtifactStore:
                 final_updates["decay"].append(item)
 
         artifact_id = generate_id("evaluation")
-        now = datetime.utcnow().isoformat() + "Z"
+        now = _utc_now_iso()
 
         artifact = {
             "id": artifact_id,
@@ -956,7 +966,7 @@ class ArtifactStore:
             "id": artifact_id,
             "type": "skill_stats",
             "version": "1.0",
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": _utc_now_iso(),
             "updated_at": None,
             "sensitivity": "internal",
             "tags": tags or [],
@@ -1010,7 +1020,7 @@ class ArtifactStore:
             "id": deterministic_id,
             "type": "skill_stats",
             "version": "1.0",
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": _utc_now_iso(),
             "updated_at": None,
             "sensitivity": "internal",
             "tags": tags or ["core", skill_id, "seeded"],
@@ -1208,7 +1218,7 @@ class ArtifactStore:
 
         # Mark evaluation as applied and store normalized items for audit trail
         data["applied"] = True
-        data["applied_at"] = datetime.utcnow().isoformat() + "Z"
+        data["applied_at"] = _utc_now_iso()
         # Replace memory_updates with normalized versions (includes breadcrumbs)
         data["memory_updates"] = {
             "reinforce": normalized_reinforce,
@@ -1280,7 +1290,7 @@ class ArtifactStore:
             data["outcome"]["confidence"] = new_confidence
 
         artifact["data"] = data
-        artifact["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        artifact["updated_at"] = _utc_now_iso()
 
         success, msg = self._update_artifact_file(artifact)
         if success:
@@ -1524,7 +1534,7 @@ class ArtifactStore:
             prev_hash = _read_last_entry_hash(deletions_log) if deletions_log.exists() else None
 
             log_entry = {
-                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "timestamp": _utc_now_iso(),
                 "action": "delete",
                 "artifact_id": artifact_id,
                 "artifact_type": artifact.get("type"),
@@ -1596,7 +1606,7 @@ class ArtifactStore:
         repairs_log = logs_dir / "audit_repairs.jsonl"
 
         repair_entry = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": _utc_now_iso(),
             "action": "repair",
             "backup_path": backup_path,
             "backup_hash": backup_hash,

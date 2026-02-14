@@ -8,8 +8,18 @@ If sqlite-vec is not available, falls back to FTS-only search.
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _utc_now() -> datetime:
+    """Return current UTC time as timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
+
+def _utc_now_iso() -> str:
+    """Return current UTC time as ISO string with Z suffix."""
+    return _utc_now().isoformat().replace("+00:00", "Z")
 from typing import Any, Optional
 
 # Check for sqlite-vec availability at module load
@@ -473,7 +483,7 @@ class ArtifactIndex:
                 """, (
                     artifact_id,
                     content_hash,
-                    datetime.utcnow().isoformat() + "Z",
+                    _utc_now_iso(),
                     model_name
                 ))
 

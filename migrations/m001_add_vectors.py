@@ -154,12 +154,12 @@ def up(db_path: str) -> dict:
 
         # Record migration
         import json
-        from datetime import datetime
+        from datetime import datetime, timezone
         conn.execute(
             "INSERT INTO migrations (id, applied_at, details) VALUES (?, ?, ?)",
             (
                 MIGRATION_ID,
-                datetime.utcnow().isoformat() + "Z",
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 json.dumps({
                     "fts5_created": result["fts5_created"],
                     "vec_created": result["vec_created"]

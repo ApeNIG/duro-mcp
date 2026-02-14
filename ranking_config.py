@@ -11,8 +11,13 @@ Key Design Decisions:
 - All thresholds are tunable
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
+
+
+def _utc_now() -> datetime:
+    """Return current UTC time as timezone-aware datetime."""
+    return datetime.now(timezone.utc)
 
 
 # Main Ranking Config
@@ -99,7 +104,7 @@ def calculate_recency_boost(created_at: str, now: Optional[datetime] = None) -> 
 
     try:
         if now is None:
-            now = datetime.utcnow()
+            now = _utc_now()
 
         # Parse created_at
         created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
@@ -204,7 +209,7 @@ def calculate_decay(fact: dict) -> float:
             created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
             if created.tzinfo:
                 created = created.replace(tzinfo=None)
-            days_old = (datetime.utcnow() - created).days
+            days_old = (_utc_now() - created).days
             if days_old < DECAY_CONFIG["grace_period_days"]:
                 return current
         except Exception:

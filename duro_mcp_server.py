@@ -15,8 +15,18 @@ import json
 import shutil
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _utc_now() -> datetime:
+    """Return current UTC time as timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
+
+def _utc_now_iso() -> str:
+    """Return current UTC time as ISO string with Z suffix."""
+    return _utc_now().isoformat().replace("+00:00", "Z")
 from typing import Any
 
 # MCP imports
@@ -272,7 +282,7 @@ def _startup_health_check() -> dict:
             # Find oldest pending file age
             if pending_files:
                 import os
-                now = datetime.utcnow().timestamp()
+                now = _utc_now().timestamp()
                 oldest_mtime = min(os.path.getmtime(f) for f in pending_files)
                 oldest_pending_age_mins = int((now - oldest_mtime) / 60)
 
@@ -313,7 +323,7 @@ def _startup_health_check() -> dict:
     has_warnings = any(c.get("status") == "warning" for c in checks.values())
 
     return {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": _utc_now_iso(),
         "overall": "error" if has_errors else ("warning" if has_warnings else "ok"),
         "checks": checks,
         "issues": issues

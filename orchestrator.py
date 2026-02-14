@@ -17,7 +17,17 @@ import re
 import string
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _utc_now() -> datetime:
+    """Return current UTC time as timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
+
+def _utc_now_iso() -> str:
+    """Return current UTC time as ISO string with Z suffix."""
+    return _utc_now().isoformat().replace("+00:00", "Z")
 from pathlib import Path
 from typing import Any, Optional
 
@@ -102,7 +112,7 @@ class RunLog:
 
 def generate_run_id() -> str:
     """Generate unique run ID."""
-    now = datetime.utcnow()
+    now = _utc_now()
     date_part = now.strftime("%Y%m%d")
     time_part = now.strftime("%H%M%S")
     random_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
@@ -262,7 +272,7 @@ class Orchestrator:
         # Initialize run log
         run = RunLog(
             run_id=run_id,
-            started_at=datetime.utcnow().isoformat() + "Z",
+            started_at=_utc_now_iso(),
             finished_at=None,
             intent=intent,
             intent_normalized=intent_normalized,
@@ -642,7 +652,7 @@ class Orchestrator:
 
     def _finalize_run(self, run: RunLog, start_time: float) -> dict:
         """Finalize and write run log."""
-        run.finished_at = datetime.utcnow().isoformat() + "Z"
+        run.finished_at = _utc_now_iso()
         run.duration_ms = int((time.time() - start_time) * 1000)
 
         # Write run log
