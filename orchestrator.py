@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 # Version info for run logs
-SERVER_BUILD = "1.1.0"
+SERVER_BUILD = "1.2.0"  # Phase 3: proactive recall
 SCHEMA_VERSION = "1.1"
 
 # Stop conditions
@@ -288,6 +288,10 @@ class Orchestrator:
         )
 
         try:
+            # Step 0: Proactive recall (Phase 3)
+            # Surface relevant memories for context - non-blocking
+            run = self._proactive_recall(run, intent, args)
+
             # Step 1: Check rules
             run = self._apply_rules(run, intent_normalized, args)
 
@@ -345,6 +349,41 @@ class Orchestrator:
                 "decision": decision["decision"],
                 "notes": decision["notes"]
             })
+
+        return run
+
+    def _proactive_recall(self, run: RunLog, intent: str, args: dict) -> RunLog:
+        """
+        Surface relevant memories for the current task.
+
+        Non-blocking: failures don't stop orchestration.
+        Recalled memories are added to run notes for context.
+        """
+        try:
+            from proactive import ProactiveRecall
+
+            # Build context from intent + args
+            context = f"{intent}: {json.dumps(args)[:500]}"
+
+            # Create recall instance
+            recall = ProactiveRecall(self.artifacts, self.artifacts.index)
+            result = recall.recall(
+                context=context,
+                limit=5,  # Keep it light for orchestration
+                include_types=["fact", "decision"],
+                force=False  # Let hot path decide
+            )
+
+            if result.triggered and result.memories:
+                # Add recalled memories as context
+                run.notes.append(f"Proactive recall surfaced {len(result.memories)} relevant memories")
+                for mem in result.memories[:3]:  # Top 3 only in notes
+                    summary = mem.get("summary", "")[:100]
+                    run.notes.append(f"  - [{mem['type']}] {summary}")
+
+        except Exception as e:
+            # Non-blocking - log but continue
+            run.notes.append(f"Proactive recall skipped: {str(e)[:50]}")
 
         return run
 

@@ -658,6 +658,56 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
+        # Auto-capture & Proactive recall tools (Phase 3)
+        Tool(
+            name="duro_proactive_recall",
+            description="Proactively recall relevant memories for current task context. Uses hot path classification + hybrid search to surface memories you might need. Call this at the start of complex tasks.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "context": {
+                        "type": "string",
+                        "description": "Current task or conversation context to find relevant memories for"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum memories to return",
+                        "default": 10
+                    },
+                    "include_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Filter to specific artifact types (e.g., ['fact', 'decision'])"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "If true, always search even if hot path classifier says no",
+                        "default": False
+                    }
+                },
+                "required": ["context"]
+            }
+        ),
+        Tool(
+            name="duro_extract_learnings",
+            description="Auto-extract learnings, facts, and decisions from conversation text. Useful for capturing insights at session end or from tool outputs.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Conversation or text to extract learnings from"
+                    },
+                    "auto_save": {
+                        "type": "boolean",
+                        "description": "If true, automatically save extracted items as artifacts",
+                        "default": False
+                    }
+                },
+                "required": ["text"]
+            }
+        ),
+
         # Artifact tools (structured memory)
         Tool(
             name="duro_store_fact",
@@ -1682,6 +1732,90 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                     if rel.get("metadata"):
                         lines.append(f"  - {rel['metadata']}")
                 text = "\n".join(lines)
+            return [TextContent(type="text", text=text)]
+
+        # Auto-capture & Proactive recall tools (Phase 3)
+        elif name == "duro_proactive_recall":
+            from proactive import ProactiveRecall
+
+            context = arguments["context"]
+            limit = arguments.get("limit", 10)
+            include_types = arguments.get("include_types")
+            force = arguments.get("force", False)
+
+            # Create ProactiveRecall instance
+            recall = ProactiveRecall(artifact_store, artifact_store.index)
+            result = recall.recall(
+                context=context,
+                limit=limit,
+                include_types=include_types,
+                force=force
+            )
+
+            if not result.triggered:
+                text = f"**Proactive Recall:** No relevant memories found.\n\nReason: {result.reason}"
+            else:
+                lines = [f"## Proactive Recall Results\n"]
+                lines.append(f"**Categories matched:** {', '.join(result.categories_matched) or 'none'}")
+                lines.append(f"**Search mode:** {result.search_mode}")
+                lines.append(f"**Recall time:** {result.recall_time_ms}ms\n")
+
+                if result.memories:
+                    lines.append("### Relevant Memories\n")
+                    for i, mem in enumerate(result.memories, 1):
+                        score = round(mem.get("relevance_score", 0), 3)
+                        lines.append(f"**{i}. [{mem['type']}]** {mem['summary'][:200]}")
+                        lines.append(f"   - ID: `{mem['id']}`")
+                        lines.append(f"   - Score: {score} | Tags: {', '.join(mem.get('tags', []))}\n")
+                else:
+                    lines.append("*No memories met the relevance threshold.*")
+
+                text = "\n".join(lines)
+            return [TextContent(type="text", text=text)]
+
+        elif name == "duro_extract_learnings":
+            from proactive import extract_learnings_from_text
+
+            text_input = arguments["text"]
+            auto_save = arguments.get("auto_save", False)
+
+            result = extract_learnings_from_text(
+                text=text_input,
+                artifact_store=artifact_store if auto_save else None,
+                auto_save=auto_save
+            )
+
+            lines = ["## Extracted Learnings\n"]
+            lines.append(f"**Total items found:** {result['count']}")
+            if auto_save:
+                lines.append(f"**Auto-saved:** {len(result['saved_ids'])} artifacts\n")
+            else:
+                lines.append("*(Use auto_save=true to persist these)*\n")
+
+            if result["learnings"]:
+                lines.append("### Learnings\n")
+                for i, learning in enumerate(result["learnings"], 1):
+                    lines.append(f"{i}. {learning}")
+                lines.append("")
+
+            if result["facts"]:
+                lines.append("### Facts\n")
+                for fact in result["facts"]:
+                    conf = fact.get("confidence", 0.5)
+                    lines.append(f"- **{fact['claim'][:150]}** (confidence: {conf})")
+                lines.append("")
+
+            if result["decisions"]:
+                lines.append("### Decisions\n")
+                for dec in result["decisions"]:
+                    lines.append(f"- **{dec['decision'][:100]}**")
+                    lines.append(f"  - Rationale: {dec.get('rationale', '')[:100]}")
+                lines.append("")
+
+            if result['count'] == 0:
+                lines.append("*No learnings, facts, or decisions detected in the text.*")
+
+            text = "\n".join(lines)
             return [TextContent(type="text", text=text)]
 
         # Artifact tools
