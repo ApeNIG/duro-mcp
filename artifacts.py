@@ -9,6 +9,7 @@ import os
 import random
 import string
 import sys
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,21 @@ from typing import Any, Optional
 
 from schemas import validate_artifact, TYPE_DIRECTORIES, apply_backward_compat_defaults
 from index import ArtifactIndex
+from embedding_worker import EmbeddingQueue
+
+# Module-level lock for audit chain atomicity
+# Prevents concurrent prev_hash read + append races within a single process.
+#
+# LIMITATION: This is an IN-PROCESS lock only. It does NOT protect against
+# race conditions when multiple processes write to the audit log concurrently.
+# For single-process usage (typical MCP server), this is sufficient.
+# For multi-process deployments, consider:
+#   1. SQLite-backed audit log with BEGIN IMMEDIATE transactions (best)
+#   2. Single-writer architecture (one process owns audit writes)
+#   3. Cross-platform file locking via portalocker library
+#
+# See KNOWN_LIMITATIONS.md for details.
+_AUDIT_CHAIN_LOCK = threading.Lock()
 
 # Platform-specific file locking
 if sys.platform == "win32":
@@ -92,6 +108,48 @@ def _sha256_full(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def _append_with_retry(
+    log_path: Path,
+    content: str,
+    max_retries: int = 10,
+    base_delay_ms: int = 50
+) -> tuple[bool, str]:
+    """
+    Append content to a file with retry on permission/lock errors.
+
+    Uses exponential backoff. Opens file only during write, no persistent handles.
+
+    Args:
+        log_path: Path to the log file
+        content: String to append (should include newline if needed)
+        max_retries: Maximum number of retry attempts
+        base_delay_ms: Base delay between retries in milliseconds
+
+    Returns:
+        (success, error_message)
+    """
+    import time
+
+    for attempt in range(max_retries):
+        try:
+            # Open only for append, write, close immediately
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+            return True, ""
+        except (PermissionError, OSError) as e:
+            if attempt < max_retries - 1:
+                # Exponential backoff: 50ms, 100ms, 200ms, 400ms...
+                delay = (base_delay_ms * (2 ** attempt)) / 1000.0
+                time.sleep(delay)
+            else:
+                return False, f"Failed after {max_retries} retries: {e}"
+        except Exception as e:
+            return False, f"Unexpected error: {e}"
+
+    return False, "Max retries exceeded"
+
+
 def _read_last_entry_hash(log_path: Path) -> Optional[str]:
     """
     Read the entry_hash from the last valid JSONL entry.
@@ -140,6 +198,157 @@ class ArtifactStore:
     def __init__(self, memory_dir: str | Path, db_path: str | Path):
         self.memory_dir = Path(memory_dir)
         self.index = ArtifactIndex(db_path)
+        # Ensure backup directory exists
+        self.backup_dir = self.memory_dir / "backups"
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        # Initialize embedding queue (Phase 1A)
+        self.embedding_queue = EmbeddingQueue(self.memory_dir)
+
+    def _backup_artifact(
+        self,
+        artifact_id: str,
+        operation: str = "delete"
+    ) -> tuple[bool, str, str]:
+        """
+        Create a backup of an artifact before destructive operations.
+
+        Args:
+            artifact_id: The artifact ID to backup
+            operation: Type of destructive operation (delete, update, etc.)
+
+        Returns:
+            (success, backup_path, message)
+
+        Backups are stored in: memory/backups/{artifact_type}/{timestamp}_{artifact_id}.json
+        """
+        # Get artifact from index
+        entry = self.index.get_by_id(artifact_id)
+        if not entry:
+            return False, "", f"Artifact '{artifact_id}' not found in index"
+
+        file_path = Path(entry["file_path"])
+        if not file_path.exists():
+            return False, "", f"Artifact file not found: {file_path}"
+
+        # Read the artifact content
+        try:
+            content = file_path.read_text(encoding='utf-8')
+            artifact = json.loads(content)
+        except Exception as e:
+            return False, "", f"Failed to read artifact: {e}"
+
+        artifact_type = artifact.get("type", "unknown")
+
+        # Create backup directory structure
+        type_backup_dir = self.backup_dir / artifact_type
+        type_backup_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate backup filename with timestamp
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"{timestamp}_{artifact_id}.json"
+        backup_path = type_backup_dir / backup_filename
+
+        # Create backup envelope with metadata
+        backup_envelope = {
+            "backup_meta": {
+                "backed_up_at": datetime.utcnow().isoformat() + "Z",
+                "operation": operation,
+                "original_path": str(file_path),
+                "original_hash": compute_hash(content)
+            },
+            "artifact": artifact
+        }
+
+        # Write backup
+        try:
+            backup_content = json.dumps(backup_envelope, indent=2, ensure_ascii=False)
+            backup_path.write_text(backup_content, encoding='utf-8')
+        except Exception as e:
+            return False, "", f"Failed to write backup: {e}"
+
+        return True, str(backup_path), f"Backup created: {backup_path}"
+
+    def restore_from_backup(
+        self,
+        backup_path: str
+    ) -> tuple[bool, str, str]:
+        """
+        Restore an artifact from a backup file.
+
+        Args:
+            backup_path: Path to the backup file
+
+        Returns:
+            (success, artifact_id, message)
+        """
+        backup_file = Path(backup_path)
+        if not backup_file.exists():
+            return False, "", f"Backup file not found: {backup_path}"
+
+        try:
+            content = backup_file.read_text(encoding='utf-8')
+            backup_envelope = json.loads(content)
+        except Exception as e:
+            return False, "", f"Failed to read backup: {e}"
+
+        artifact = backup_envelope.get("artifact")
+        if not artifact:
+            return False, "", "Invalid backup format: missing 'artifact' key"
+
+        # Store the artifact (will validate and index)
+        success, artifact_id, path = self._store_artifact(artifact)
+        if success:
+            return True, artifact_id, f"Restored artifact '{artifact_id}' from backup"
+        return False, "", f"Failed to restore: {path}"
+
+    def list_backups(
+        self,
+        artifact_type: Optional[str] = None,
+        limit: int = 50
+    ) -> list[dict]:
+        """
+        List available backups.
+
+        Args:
+            artifact_type: Filter by artifact type
+            limit: Maximum number of backups to return
+
+        Returns:
+            List of backup info dicts
+        """
+        backups = []
+
+        if artifact_type:
+            type_dirs = [self.backup_dir / artifact_type]
+        else:
+            type_dirs = [d for d in self.backup_dir.iterdir() if d.is_dir()]
+
+        for type_dir in type_dirs:
+            if not type_dir.exists():
+                continue
+            for backup_file in sorted(type_dir.glob("*.json"), reverse=True):
+                if len(backups) >= limit:
+                    break
+                try:
+                    stat = backup_file.stat()
+                    # Extract artifact_id from filename
+                    parts = backup_file.stem.split("_", 2)
+                    if len(parts) >= 3:
+                        artifact_id = parts[2]
+                    else:
+                        artifact_id = backup_file.stem
+
+                    backups.append({
+                        "path": str(backup_file),
+                        "artifact_id": artifact_id,
+                        "type": type_dir.name,
+                        "size_bytes": stat.st_size,
+                        "created_at": datetime.fromtimestamp(stat.st_mtime).isoformat()
+                    })
+                except Exception:
+                    continue
+
+        return backups[:limit]
 
     def store_fact(
         self,
@@ -1154,6 +1363,22 @@ class ArtifactStore:
         if not success:
             return False, artifact["id"], str(file_path)  # File written but index failed
 
+        # Populate FTS text column (best effort, never block save)
+        try:
+            self.index.populate_fts_text(artifact["id"], artifact)
+        except Exception as e:
+            # FTS failure shouldn't block artifact storage
+            print(f"[WARN] Failed to populate FTS text: {e}", file=sys.stderr)
+
+        # Queue for embedding (non-blocking, Phase 1A)
+        try:
+            from embeddings import should_embed
+            if should_embed(artifact):
+                self.embedding_queue.queue_for_embedding(artifact["id"])
+        except Exception as e:
+            # Embedding queue failure shouldn't block artifact storage
+            print(f"[WARN] Failed to queue for embedding: {e}", file=sys.stderr)
+
         return True, artifact["id"], str(file_path)
 
     def get_artifact(self, artifact_id: str) -> Optional[dict[str, Any]]:
@@ -1230,7 +1455,8 @@ class ArtifactStore:
         self,
         artifact_id: str,
         reason: str,
-        force: bool = False
+        force: bool = False,
+        skip_backup: bool = False
     ) -> tuple[bool, str]:
         """
         Delete an artifact with guardrails.
@@ -1239,6 +1465,7 @@ class ArtifactStore:
             artifact_id: The artifact ID to delete
             reason: Required explanation for why this is being deleted
             force: Override sensitivity protection (use with caution)
+            skip_backup: Skip creating backup (use with caution)
 
         Returns:
             (success, message)
@@ -1246,6 +1473,7 @@ class ArtifactStore:
         Guardrails:
             - MUST provide reason
             - MUST NOT delete sensitive artifacts unless force=True
+            - MUST backup artifact before deletion (unless skip_backup=True)
             - MUST log all deletions to memory/logs/deletions.jsonl
         """
         # Guardrail 1: Reason is required
@@ -1275,6 +1503,14 @@ class ArtifactStore:
         if sensitivity == "sensitive" and not force:
             return False, "Cannot delete sensitive artifacts without force=True"
 
+        # Guardrail 3: Backup before deletion (BLOCKS on failure)
+        backup_path = None
+        if not skip_backup:
+            backup_success, backup_path, backup_msg = self._backup_artifact(artifact_id, "delete")
+            if not backup_success:
+                # Backup failure BLOCKS deletion - we don't delete without a safety net
+                return False, f"Backup failed, deletion blocked: {backup_msg}"
+
         # Compute hash for audit log
         file_hash = compute_hash(content)
 
@@ -1282,49 +1518,40 @@ class ArtifactStore:
         logs_dir.mkdir(parents=True, exist_ok=True)
         deletions_log = logs_dir / "deletions.jsonl"
 
-        # Use file locking for atomic read-last-hash + append-new-entry
-        # This prevents race conditions when two deletes happen simultaneously
-        try:
-            # Open in r+b if exists, otherwise create new
-            if deletions_log.exists():
-                lock_file = open(deletions_log, "r+b")
-            else:
-                # Create empty file first
-                deletions_log.touch()
-                lock_file = open(deletions_log, "r+b")
+        # Guardrail 4: Write audit entry BEFORE deleting (blocks on failure)
+        # Use lock to ensure atomic prev_hash read + append (prevents chain races)
+        with _AUDIT_CHAIN_LOCK:
+            prev_hash = _read_last_entry_hash(deletions_log) if deletions_log.exists() else None
 
-            with lock_file:
-                with file_lock(lock_file):
-                    # Get prev_hash from last entry's entry_hash (integrity chain)
-                    # Must read while holding lock to prevent races
-                    prev_hash = _read_last_entry_hash(deletions_log)
-                    # prev_hash is None for first entry or legacy boundary
+            log_entry = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "action": "delete",
+                "artifact_id": artifact_id,
+                "artifact_type": artifact.get("type"),
+                "sensitivity": sensitivity,
+                "file_hash": file_hash,
+                "reason": reason,
+                "force_used": force,
+                "backup_path": backup_path,
+                "prev_hash": prev_hash,
+                "chain_version": 1
+            }
+            # Compute entry_hash from canonical JSON (full SHA-256)
+            entry_hash = _sha256_full(_canonical_json(log_entry))
+            log_entry["entry_hash"] = entry_hash
 
-                    # Log deletion BEFORE deleting (so we have a record even if delete fails)
-                    log_entry = {
-                        "timestamp": datetime.utcnow().isoformat() + "Z",
-                        "action": "delete",
-                        "artifact_id": artifact_id,
-                        "artifact_type": artifact.get("type"),
-                        "sensitivity": sensitivity,
-                        "file_hash": file_hash,
-                        "reason": reason,
-                        "force_used": force,
-                        "prev_hash": prev_hash,
-                        "chain_version": 1
-                    }
-                    # Compute entry_hash from canonical JSON (full SHA-256)
-                    entry_hash = _sha256_full(_canonical_json(log_entry))
-                    log_entry["entry_hash"] = entry_hash
+            # Append with retry - blocks deletion if audit can't be written
+            audit_success, audit_error = _append_with_retry(
+                deletions_log,
+                _canonical_json(log_entry) + "\n",
+                max_retries=10,
+                base_delay_ms=50
+            )
+        # Lock released here - chain is now consistent
 
-                    # Append while holding lock
-                    with open(deletions_log, "a", encoding="utf-8") as f:
-                        f.write(_canonical_json(log_entry) + "\n")
-
-        except TimeoutError:
-            return False, "Failed to acquire lock on deletion log (concurrent operation)"
-        except Exception as e:
-            return False, f"Failed to write deletion log: {e}"
+        if not audit_success:
+            # Audit failure BLOCKS deletion - unlogged deletions are unacceptable
+            return False, f"Audit log write failed, deletion blocked: {audit_error}"
 
         # Delete the file
         try:
@@ -1335,7 +1562,10 @@ class ArtifactStore:
         # Remove from index
         self.index.delete(artifact_id)
 
-        return True, f"Artifact '{artifact_id}' deleted. Reason logged."
+        msg = f"Artifact '{artifact_id}' deleted. Reason logged."
+        if backup_path:
+            msg += f" Backup: {backup_path}"
+        return True, msg
 
     def log_audit_repair(
         self,

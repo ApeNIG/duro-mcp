@@ -1,6 +1,9 @@
 """
 SQLite index layer for Duro artifacts.
 Provides fast querying while files remain canonical.
+
+Phase 1B: Adds hybrid search (vector + FTS5) with graceful degradation.
+If sqlite-vec is not available, falls back to FTS-only search.
 """
 
 import json
@@ -8,6 +11,14 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+
+# Check for sqlite-vec availability at module load
+_VEC_AVAILABLE = False
+try:
+    import sqlite_vec
+    _VEC_AVAILABLE = True
+except ImportError:
+    pass
 
 
 class ArtifactIndex:
@@ -282,3 +293,768 @@ class ArtifactIndex:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM artifacts")
             conn.commit()
+
+    def get_fts_completeness(self) -> dict:
+        """
+        Check FTS text coverage for health reporting.
+
+        Returns:
+            {
+                "fts_exists": bool,
+                "total_fts_rows": int,
+                "missing_text_count": int,  # rows with text='' or NULL
+                "coverage_pct": float
+            }
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Check if FTS table exists
+                cursor = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='artifact_fts'"
+                )
+                if not cursor.fetchone():
+                    return {"fts_exists": False, "total_fts_rows": 0, "missing_text_count": 0, "coverage_pct": 0.0}
+
+                # Count total FTS rows
+                total = conn.execute("SELECT COUNT(*) FROM artifact_fts").fetchone()[0]
+
+                # Count rows with missing text
+                missing = conn.execute(
+                    "SELECT COUNT(*) FROM artifact_fts WHERE text IS NULL OR text = ''"
+                ).fetchone()[0]
+
+                coverage = ((total - missing) / total * 100) if total > 0 else 100.0
+
+                return {
+                    "fts_exists": True,
+                    "total_fts_rows": total,
+                    "missing_text_count": missing,
+                    "coverage_pct": round(coverage, 1)
+                }
+        except Exception as e:
+            return {"fts_exists": False, "error": str(e)}
+
+    def get_embedding_stats(self) -> dict:
+        """
+        Check embedding/vector status for health reporting.
+
+        Returns:
+            {
+                "vec_extension_available": bool,
+                "vec_table_exists": bool,
+                "embeddings_count": int,
+                "artifacts_count": int,
+                "coverage_pct": float,
+                "embedding_dim": int or None
+            }
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                artifacts_count = conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
+
+                # Check vec extension
+                vec_available = self._load_vec_extension(conn)
+
+                # Check vec table exists
+                cursor = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='artifact_vectors'"
+                )
+                vec_table_exists = cursor.fetchone() is not None
+
+                if not vec_table_exists:
+                    return {
+                        "vec_extension_available": vec_available,
+                        "vec_table_exists": False,
+                        "embeddings_count": 0,
+                        "artifacts_count": artifacts_count,
+                        "coverage_pct": 0.0,
+                        "embedding_dim": None
+                    }
+
+                # Count embeddings
+                embeddings_count = conn.execute(
+                    "SELECT COUNT(*) FROM artifact_vectors"
+                ).fetchone()[0]
+
+                coverage = (embeddings_count / artifacts_count * 100) if artifacts_count > 0 else 0.0
+
+                # Try to get dimension from embedding_state or schema
+                embedding_dim = None
+                try:
+                    cursor = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='embedding_state'"
+                    )
+                    if cursor.fetchone():
+                        row = conn.execute(
+                            "SELECT model FROM embedding_state LIMIT 1"
+                        ).fetchone()
+                        if row and "384" in str(row[0]):
+                            embedding_dim = 384
+                except Exception:
+                    pass
+
+                return {
+                    "vec_extension_available": vec_available,
+                    "vec_table_exists": vec_table_exists,
+                    "embeddings_count": embeddings_count,
+                    "artifacts_count": artifacts_count,
+                    "coverage_pct": round(coverage, 1),
+                    "embedding_dim": embedding_dim
+                }
+        except Exception as e:
+            return {"vec_extension_available": False, "error": str(e)}
+
+    # ========================================
+    # Phase 1B: Hybrid Search Methods
+    # ========================================
+
+    def _load_vec_extension(self, conn) -> bool:
+        """Load sqlite-vec extension if available."""
+        if not _VEC_AVAILABLE:
+            return False
+        try:
+            import sqlite_vec
+            # Must enable extension loading before loading
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            return True
+        except Exception as e:
+            print(f"[WARN] Failed to load sqlite-vec: {e}")
+            return False
+
+    def _has_fts(self, conn) -> bool:
+        """Check if FTS5 table exists."""
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='artifact_fts'"
+        )
+        return cursor.fetchone() is not None
+
+    def _has_vectors(self, conn) -> bool:
+        """Check if vector table exists and is usable."""
+        if not self._load_vec_extension(conn):
+            return False
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='artifact_vectors'"
+        )
+        return cursor.fetchone() is not None
+
+    def upsert_embedding(
+        self,
+        artifact_id: str,
+        embedding: list[float],
+        content_hash: str,
+        model_name: str = "bge-small-en-v1.5"
+    ) -> bool:
+        """
+        Store or update an embedding for an artifact.
+
+        Args:
+            artifact_id: The artifact ID
+            embedding: Vector embedding (list of floats)
+            content_hash: Hash of content that was embedded
+            model_name: Name of the embedding model used
+
+        Returns:
+            True on success, False if vectors not available
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                if not self._has_vectors(conn):
+                    return False
+
+                # Update embedding state
+                conn.execute("""
+                    INSERT INTO embedding_state (artifact_id, content_hash, embedded_at, model)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(artifact_id) DO UPDATE SET
+                        content_hash = excluded.content_hash,
+                        embedded_at = excluded.embedded_at,
+                        model = excluded.model
+                """, (
+                    artifact_id,
+                    content_hash,
+                    datetime.utcnow().isoformat() + "Z",
+                    model_name
+                ))
+
+                # Store embedding vector using sqlite-vec's serialize format
+                import sqlite_vec
+                vec_bytes = sqlite_vec.serialize_float32(embedding)
+
+                conn.execute("""
+                    INSERT INTO artifact_vectors (artifact_id, embedding)
+                    VALUES (?, ?)
+                    ON CONFLICT(artifact_id) DO UPDATE SET
+                        embedding = excluded.embedding
+                """, (artifact_id, vec_bytes))
+
+                conn.commit()
+                return True
+
+        except Exception as e:
+            print(f"Embedding upsert error: {e}")
+            return False
+
+    def delete_embedding(self, artifact_id: str) -> bool:
+        """Delete embedding for an artifact."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM embedding_state WHERE artifact_id = ?", (artifact_id,))
+                if self._has_vectors(conn):
+                    conn.execute("DELETE FROM artifact_vectors WHERE artifact_id = ?", (artifact_id,))
+                conn.commit()
+                return True
+        except Exception:
+            return False
+
+    def _escape_fts_query(self, query: str) -> str:
+        """
+        Escape special FTS5 characters in user query.
+
+        FTS5 special chars: " : - * ( ) { } [ ] ^ ~
+        Strategy: wrap each word in quotes for phrase-like matching
+        """
+        # Remove problematic characters that can't be in quoted phrases
+        import re
+
+        # Split into words, escape each, rejoin
+        words = query.split()
+        safe_words = []
+
+        for word in words:
+            # Remove FTS5 operators and special chars
+            clean = re.sub(r'[":*(){}[\]^~\-]', ' ', word)
+            clean = clean.strip()
+            if clean:
+                # Wrap in quotes for exact phrase matching
+                safe_words.append(f'"{clean}"')
+
+        if not safe_words:
+            return '""'  # Empty query
+
+        # Join with OR for flexible matching
+        return " OR ".join(safe_words)
+
+    def fts_search(
+        self,
+        query: str,
+        artifact_type: Optional[str] = None,
+        limit: int = 50
+    ) -> list[dict]:
+        """
+        Full-text search using FTS5.
+
+        Args:
+            query: Search query (will be escaped for safety)
+            artifact_type: Optional type filter
+            limit: Max results
+
+        Returns:
+            List of {id, score, title} dicts sorted by relevance
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                if not self._has_fts(conn):
+                    # Fall back to LIKE search
+                    return self._like_search(conn, query, artifact_type, limit)
+
+                # Escape user query for FTS5 safety
+                safe_query = self._escape_fts_query(query)
+
+                # Use subquery pattern: first get FTS matches, then join for details
+                sql = """
+                    SELECT a.id, a.title, a.type, fts_matches.score
+                    FROM (
+                        SELECT id, bm25(artifact_fts) as score
+                        FROM artifact_fts
+                        WHERE artifact_fts MATCH ?
+                    ) fts_matches
+                    JOIN artifacts a ON a.id = fts_matches.id
+                """
+                params = [safe_query]
+
+                if artifact_type:
+                    sql += " WHERE a.type = ?"
+                    params.append(artifact_type)
+
+                sql += " ORDER BY fts_matches.score LIMIT ?"
+                params.append(limit)
+
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(sql, params)
+
+                results = []
+                for row in cursor:
+                    results.append({
+                        "id": row["id"],
+                        "title": row["title"],
+                        "type": row["type"],
+                        "score": abs(row["score"]),  # BM25 returns negative scores
+                        "source": "fts"
+                    })
+                return results
+
+        except Exception as e:
+            print(f"FTS search error: {e}")
+            return []
+
+    def _like_search(
+        self,
+        conn,
+        query: str,
+        artifact_type: Optional[str],
+        limit: int
+    ) -> list[dict]:
+        """Fallback LIKE search when FTS not available."""
+        sql = """
+            SELECT id, title, type
+            FROM artifacts
+            WHERE (title LIKE ? OR tags LIKE ?)
+        """
+        params = [f"%{query}%", f"%{query}%"]
+
+        if artifact_type:
+            sql += " AND type = ?"
+            params.append(artifact_type)
+
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(sql, params)
+
+        results = []
+        for row in cursor:
+            results.append({
+                "id": row["id"],
+                "title": row["title"],
+                "type": row["type"],
+                "score": 0.5,  # Default score for LIKE matches
+                "source": "like"
+            })
+        return results
+
+    def vector_search(
+        self,
+        query_embedding: list[float],
+        artifact_type: Optional[str] = None,
+        limit: int = 50
+    ) -> list[dict]:
+        """
+        Vector similarity search using vec0 KNN queries.
+
+        Uses sqlite-vec's optimized MATCH + k pattern for O(log n) search
+        instead of O(n) brute force with vec_distance_cosine.
+
+        Args:
+            query_embedding: Query vector
+            artifact_type: Optional type filter
+            limit: Max results
+
+        Returns:
+            List of {id, score, title} dicts sorted by similarity
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                if not self._has_vectors(conn):
+                    return []
+
+                # Serialize query vector using sqlite-vec format
+                import sqlite_vec
+                query_vec = sqlite_vec.serialize_float32(query_embedding)
+
+                # Use vec0 KNN query pattern (MATCH + k) for O(log n) performance
+                # First get KNN results from vec0, then join for metadata
+                # Note: vec0 returns rowid and distance
+                sql = """
+                    SELECT v.artifact_id, v.distance
+                    FROM artifact_vectors v
+                    WHERE v.embedding MATCH ?
+                      AND k = ?
+                    ORDER BY v.distance
+                """
+                params = [query_vec, limit * 2]  # Get extra for type filter
+
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(sql, params)
+
+                # Collect results and join with artifacts table
+                knn_results = list(cursor)
+
+                if not knn_results:
+                    return []
+
+                # Get artifact metadata
+                artifact_ids = [r["artifact_id"] for r in knn_results]
+                placeholders = ",".join("?" * len(artifact_ids))
+                meta_sql = f"""
+                    SELECT id, title, type
+                    FROM artifacts
+                    WHERE id IN ({placeholders})
+                """
+                cursor = conn.execute(meta_sql, artifact_ids)
+                metadata = {row["id"]: dict(row) for row in cursor}
+
+                results = []
+                for row in knn_results:
+                    aid = row["artifact_id"]
+                    distance = row["distance"]
+
+                    if aid not in metadata:
+                        continue
+
+                    meta = metadata[aid]
+
+                    # Apply type filter if specified
+                    if artifact_type and meta["type"] != artifact_type:
+                        continue
+
+                    # Convert distance to similarity score
+                    # For cosine distance: similarity = 1 - distance
+                    similarity = max(0, 1.0 - distance)
+
+                    results.append({
+                        "id": aid,
+                        "title": meta["title"],
+                        "type": meta["type"],
+                        "score": similarity,
+                        "source": "vector"
+                    })
+
+                    if len(results) >= limit:
+                        break
+
+                return results
+
+        except Exception as e:
+            print(f"Vector search error: {e}")
+            return []
+
+    def hybrid_search(
+        self,
+        query: str,
+        query_embedding: Optional[list[float]] = None,
+        artifact_type: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        limit: int = 50,
+        explain: bool = False
+    ) -> dict:
+        """
+        Hybrid search combining vector and FTS results.
+
+        Uses RRF (Reciprocal Rank Fusion) to merge results.
+        Gracefully degrades: vector-only, FTS-only, or LIKE-only.
+
+        Args:
+            query: Text query for FTS
+            query_embedding: Optional vector for semantic search
+            artifact_type: Filter by type
+            tags: Filter by tags (any match)
+            limit: Max results
+            explain: Include score breakdown in results
+
+        Returns:
+            {
+                "results": [...],
+                "mode": "hybrid" | "fts_only" | "vector_only" | "keyword_only",
+                "fts_count": int,
+                "vector_count": int
+            }
+        """
+        from ranking_config import (
+            RANKING,
+            calculate_recency_boost,
+            calculate_type_weight,
+            calculate_confidence_boost,
+            explain_score
+        )
+
+        # Get FTS results
+        fts_results = self.fts_search(query, artifact_type, limit * 2)
+
+        # Get vector results if embedding provided
+        vector_results = []
+        if query_embedding:
+            vector_results = self.vector_search(query_embedding, artifact_type, limit * 2)
+
+        # Determine search mode
+        if vector_results and fts_results:
+            mode = "hybrid"
+        elif vector_results:
+            mode = "vector_only"
+        elif fts_results and fts_results[0].get("source") == "fts":
+            mode = "fts_only"
+        else:
+            mode = "keyword_only"
+
+        # RRF fusion
+        rrf_k = RANKING["rrf_k"]
+        scores = {}  # artifact_id -> combined_score
+
+        # Score FTS results
+        for rank, result in enumerate(fts_results):
+            aid = result["id"]
+            rrf_score = 1.0 / (rrf_k + rank + 1)
+            if aid not in scores:
+                scores[aid] = {"rrf": 0, "fts_rank": None, "vec_rank": None, "meta": result}
+            scores[aid]["rrf"] += RANKING["bm25_weight"] * rrf_score
+            scores[aid]["fts_rank"] = rank + 1
+            scores[aid]["fts_score"] = result["score"]
+
+        # Score vector results
+        for rank, result in enumerate(vector_results):
+            aid = result["id"]
+            rrf_score = 1.0 / (rrf_k + rank + 1)
+            if aid not in scores:
+                scores[aid] = {"rrf": 0, "fts_rank": None, "vec_rank": None, "meta": result}
+            scores[aid]["rrf"] += RANKING["vector_weight"] * rrf_score
+            scores[aid]["vec_rank"] = rank + 1
+            scores[aid]["vec_score"] = result["score"]
+
+        # Get full artifact info for boosting
+        results = []
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+
+            for aid, data in scores.items():
+                # Get artifact details
+                cursor = conn.execute(
+                    "SELECT * FROM artifacts WHERE id = ?", (aid,)
+                )
+                row = cursor.fetchone()
+                if not row:
+                    continue
+
+                # Apply boosts
+                created_at = row["created_at"] or ""
+                artifact_type = row["type"]
+
+                recency_boost = calculate_recency_boost(created_at)
+                type_weight = calculate_type_weight(artifact_type)
+
+                # Calculate final score
+                base_score = data["rrf"]
+                final_score = base_score * type_weight + recency_boost
+
+                result = {
+                    "id": aid,
+                    "type": artifact_type,
+                    "title": row["title"],
+                    "created_at": created_at,
+                    "tags": json.loads(row["tags"]) if row["tags"] else [],
+                    "file_path": row["file_path"],
+                    "search_score": round(final_score, 4)
+                }
+
+                if explain:
+                    result["score_components"] = {
+                        "rrf_base": round(base_score, 4),
+                        "type_weight": round(type_weight, 4),
+                        "recency_boost": round(recency_boost, 4),
+                        "fts_rank": data.get("fts_rank"),
+                        "vec_rank": data.get("vec_rank"),
+                        "fts_score": round(data.get("fts_score", 0), 4),
+                        "vec_score": round(data.get("vec_score", 0), 4)
+                    }
+                    result["explain"] = explain_score(result["score_components"])
+
+                results.append(result)
+
+        # Sort by score and apply limit
+        results.sort(key=lambda x: x["search_score"], reverse=True)
+
+        # Filter by min score threshold
+        min_score = RANKING["min_score_threshold"]
+        results = [r for r in results if r["search_score"] >= min_score]
+
+        # Apply tag filter if provided
+        if tags:
+            tag_set = set(tags)
+            results = [r for r in results if tag_set & set(r.get("tags", []))]
+
+        results = results[:limit]
+
+        return {
+            "results": results,
+            "mode": mode,
+            "fts_count": len(fts_results),
+            "vector_count": len(vector_results),
+            "total_candidates": len(scores)
+        }
+
+    def populate_fts_text(self, artifact_id: str, artifact: dict) -> bool:
+        """
+        Update the FTS text column with semantic content from artifact_to_text.
+
+        Called during reindex to populate searchable text for each artifact.
+        Triggers only store title/tags, not semantic text.
+        """
+        try:
+            from embeddings import artifact_to_text
+
+            text = artifact_to_text(artifact)
+            if not text:
+                text = ""
+
+            # Truncate very long text (FTS performance)
+            text = text[:2000]
+
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE artifact_fts SET text = ? WHERE id = ?",
+                    (text, artifact_id)
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"FTS text update error for {artifact_id}: {e}")
+            return False
+
+    def rebuild_fts(self) -> dict:
+        """
+        Rebuild FTS index with proper content.
+
+        Drops and recreates FTS table, populates with:
+        - id, title from artifacts table
+        - tags as space-separated (not JSON)
+        - text from artifact_to_text()
+
+        Returns: {success, indexed_count, errors}
+        """
+        from embeddings import artifact_to_text
+
+        result = {"success": False, "indexed_count": 0, "errors": []}
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Drop and recreate FTS table
+                conn.execute("DROP TABLE IF EXISTS artifact_fts")
+                conn.execute("""
+                    CREATE VIRTUAL TABLE artifact_fts USING fts5(
+                        id UNINDEXED,
+                        title,
+                        tags,
+                        text
+                    )
+                """)
+
+                # Get all artifacts
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute("SELECT id, title, tags, file_path FROM artifacts")
+
+                for row in cursor:
+                    artifact_id = row["id"]
+                    title = row["title"] or ""
+
+                    # Convert JSON tags to space-separated
+                    tags_json = row["tags"] or "[]"
+                    try:
+                        tags_list = json.loads(tags_json)
+                        tags_str = " ".join(tags_list) if isinstance(tags_list, list) else ""
+                    except Exception:
+                        tags_str = ""
+
+                    # Get semantic text from artifact file
+                    text = ""
+                    file_path = row["file_path"]
+                    if file_path:
+                        try:
+                            with open(file_path, "r", encoding="utf-8") as f:
+                                artifact = json.load(f)
+                            text = artifact_to_text(artifact)[:2000]
+                        except Exception:
+                            pass
+
+                    # Insert into FTS
+                    conn.execute(
+                        "INSERT INTO artifact_fts (id, title, tags, text) VALUES (?, ?, ?, ?)",
+                        (artifact_id, title, tags_str, text)
+                    )
+                    result["indexed_count"] += 1
+
+                # Recreate triggers
+                conn.execute("DROP TRIGGER IF EXISTS artifacts_ai")
+                conn.execute("DROP TRIGGER IF EXISTS artifacts_ad")
+                conn.execute("DROP TRIGGER IF EXISTS artifacts_au")
+
+                conn.execute("""
+                    CREATE TRIGGER artifacts_ai AFTER INSERT ON artifacts BEGIN
+                        INSERT INTO artifact_fts(id, title, tags, text)
+                        VALUES (
+                            NEW.id,
+                            NEW.title,
+                            REPLACE(REPLACE(REPLACE(NEW.tags, '["', ''), '"]', ''), '","', ' '),
+                            ''
+                        );
+                    END
+                """)
+                conn.execute("""
+                    CREATE TRIGGER artifacts_ad AFTER DELETE ON artifacts BEGIN
+                        DELETE FROM artifact_fts WHERE id = OLD.id;
+                    END
+                """)
+                conn.execute("""
+                    CREATE TRIGGER artifacts_au AFTER UPDATE ON artifacts BEGIN
+                        DELETE FROM artifact_fts WHERE id = OLD.id;
+                        INSERT INTO artifact_fts(id, title, tags, text)
+                        VALUES (
+                            NEW.id,
+                            NEW.title,
+                            REPLACE(REPLACE(REPLACE(NEW.tags, '["', ''), '"]', ''), '","', ' '),
+                            ''
+                        );
+                    END
+                """)
+
+                conn.commit()
+                result["success"] = True
+
+        except Exception as e:
+            result["errors"].append(str(e))
+
+        return result
+
+    def get_search_capabilities(self) -> dict:
+        """
+        Get current search capabilities.
+
+        Returns:
+            {
+                "fts_available": bool,
+                "vector_available": bool,
+                "embedding_count": int,
+                "mode": str
+            }
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                fts = self._has_fts(conn)
+                vec = self._has_vectors(conn)
+
+                embedding_count = 0
+                if vec:
+                    cursor = conn.execute("SELECT COUNT(*) FROM embedding_state")
+                    embedding_count = cursor.fetchone()[0]
+
+                if vec and fts:
+                    mode = "hybrid"
+                elif vec:
+                    mode = "vector_only"
+                elif fts:
+                    mode = "fts_only"
+                else:
+                    mode = "keyword_only"
+
+                return {
+                    "fts_available": fts,
+                    "vector_available": vec,
+                    "embedding_count": embedding_count,
+                    "mode": mode
+                }
+        except Exception:
+            return {
+                "fts_available": False,
+                "vector_available": False,
+                "embedding_count": 0,
+                "mode": "keyword_only"
+            }

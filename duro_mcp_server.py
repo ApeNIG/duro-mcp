@@ -12,6 +12,8 @@ Exposes tools for:
 
 import asyncio
 import json
+import shutil
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -71,7 +73,262 @@ def _startup_ensure_consistency():
     if error_count > 0:
         print(f"[WARN] Startup reindex: {success_count} indexed, {error_count} errors", file=sys.stderr)
 
+    # Rebuild FTS to populate semantic text column
+    # (Triggers can't call Python, so text column is empty after reindex)
+    fts_result = artifact_store.index.rebuild_fts()
+    if not fts_result.get("success"):
+        print(f"[WARN] FTS rebuild failed: {fts_result}", file=sys.stderr)
+
 _startup_ensure_consistency()
+
+
+def _startup_health_check() -> dict:
+    """
+    Run health checks on Duro system components.
+    Returns dict with check results for diagnostics.
+    """
+    checks = {}
+    issues = []
+
+    # 1. SQLite integrity check
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            checks["sqlite_integrity"] = {
+                "status": "ok" if result == "ok" else "error",
+                "message": result
+            }
+            if result != "ok":
+                issues.append(f"SQLite integrity check failed: {result}")
+    except Exception as e:
+        checks["sqlite_integrity"] = {"status": "error", "message": str(e)}
+        issues.append(f"SQLite integrity check error: {e}")
+
+    # 2. Index sync check - compare indexed count vs file count
+    try:
+        indexed_count = artifact_store.index.count()
+        file_count = 0
+        from schemas import TYPE_DIRECTORIES
+        for type_name, dir_name in TYPE_DIRECTORIES.items():
+            type_dir = MEMORY_DIR / dir_name
+            if type_dir.exists():
+                file_count += len(list(type_dir.glob("*.json")))
+
+        drift = abs(indexed_count - file_count)
+        sync_ok = drift < 5
+        checks["index_sync"] = {
+            "status": "ok" if sync_ok else "warning",
+            "indexed": indexed_count,
+            "files": file_count,
+            "drift": drift
+        }
+        if not sync_ok:
+            issues.append(f"Index drift: {drift} (indexed={indexed_count}, files={file_count})")
+    except Exception as e:
+        checks["index_sync"] = {"status": "error", "message": str(e)}
+        issues.append(f"Index sync check error: {e}")
+
+    # 3. Audit chain verification (last 10 entries)
+    try:
+        audit_result = artifact_store.query_audit_log(limit=10, verify_chain=True)
+        chain_valid = audit_result.get("chain_valid")
+        if chain_valid is None:
+            checks["audit_chain"] = {"status": "ok", "message": "No audit entries (empty chain)"}
+        elif chain_valid:
+            checks["audit_chain"] = {
+                "status": "ok",
+                "message": f"Chain valid ({audit_result.get('total', 0)} entries verified)"
+            }
+        else:
+            # Find first broken entry for diagnostics
+            chain_details = audit_result.get("chain_details", [])
+            first_broken = None
+            for detail in chain_details:
+                if detail.get("status") != "valid":
+                    first_broken = detail
+                    break
+
+            checks["audit_chain"] = {
+                "status": "error",
+                "message": "Chain integrity broken - possible tampering",
+                "first_broken_entry": first_broken.get("entry") if first_broken else None,
+                "first_broken_timestamp": first_broken.get("timestamp") if first_broken else None,
+                "first_broken_reason": first_broken.get("status") if first_broken else None
+            }
+            issues.append(f"Audit chain integrity broken at entry {first_broken.get('entry') if first_broken else '?'}")
+    except Exception as e:
+        checks["audit_chain"] = {"status": "error", "message": str(e)}
+        issues.append(f"Audit chain check error: {e}")
+
+    # 4. Disk space check
+    try:
+        total, used, free = shutil.disk_usage(MEMORY_DIR)
+        free_gb = free / (1024 ** 3)
+        disk_ok = free_gb > 1.0
+        checks["disk_space"] = {
+            "status": "ok" if disk_ok else "warning",
+            "free_gb": round(free_gb, 2),
+            "total_gb": round(total / (1024 ** 3), 2)
+        }
+        if not disk_ok:
+            issues.append(f"Low disk space: {round(free_gb, 2)} GB free")
+    except Exception as e:
+        checks["disk_space"] = {"status": "error", "message": str(e)}
+        issues.append(f"Disk space check error: {e}")
+
+    # 5. FTS completeness check
+    try:
+        fts_stats = artifact_store.index.get_fts_completeness()
+        if not fts_stats.get("fts_exists"):
+            checks["fts_completeness"] = {
+                "status": "warning",
+                "message": "FTS table not created",
+                "fts_exists": False
+            }
+            issues.append("FTS table not created - run migration")
+        else:
+            missing = fts_stats.get("missing_text_count", 0)
+            coverage = fts_stats.get("coverage_pct", 100)
+            # Warning if >10% missing, error if >50% missing
+            if coverage < 50:
+                status = "error"
+            elif coverage < 90:
+                status = "warning"
+            else:
+                status = "ok"
+
+            checks["fts_completeness"] = {
+                "status": status,
+                "fts_exists": True,
+                "total_fts_rows": fts_stats.get("total_fts_rows", 0),
+                "missing_text_count": missing,
+                "coverage_pct": coverage
+            }
+            if missing > 0:
+                issues.append(f"FTS has {missing} rows missing semantic text ({coverage}% coverage)")
+    except Exception as e:
+        checks["fts_completeness"] = {"status": "error", "message": str(e)}
+        issues.append(f"FTS completeness check error: {e}")
+
+    # 6. Embedding/vector coverage check
+    try:
+        emb_stats = artifact_store.index.get_embedding_stats()
+        vec_available = emb_stats.get("vec_extension_available", False)
+        vec_table = emb_stats.get("vec_table_exists", False)
+
+        if not vec_available:
+            checks["embedding_coverage"] = {
+                "status": "ok",  # Not an error - graceful degradation
+                "message": "sqlite-vec not available - FTS-only mode",
+                "vec_extension_available": False,
+                "vec_table_exists": False
+            }
+        elif not vec_table:
+            checks["embedding_coverage"] = {
+                "status": "warning",
+                "message": "sqlite-vec available but vector table not created",
+                "vec_extension_available": True,
+                "vec_table_exists": False
+            }
+            issues.append("Vector table not created - run migration")
+        else:
+            emb_count = emb_stats.get("embeddings_count", 0)
+            art_count = emb_stats.get("artifacts_count", 0)
+            coverage = emb_stats.get("coverage_pct", 0)
+
+            # Warning if <50% coverage, error if <10%
+            if art_count > 0 and coverage < 10:
+                status = "warning"
+            else:
+                status = "ok"
+
+            checks["embedding_coverage"] = {
+                "status": status,
+                "vec_extension_available": True,
+                "vec_table_exists": True,
+                "embeddings_count": emb_count,
+                "artifacts_count": art_count,
+                "coverage_pct": coverage,
+                "embedding_dim": emb_stats.get("embedding_dim")
+            }
+            if art_count > 0 and coverage < 50:
+                issues.append(f"Only {coverage}% of artifacts have embeddings ({emb_count}/{art_count})")
+    except Exception as e:
+        checks["embedding_coverage"] = {"status": "error", "message": str(e)}
+        issues.append(f"Embedding coverage check error: {e}")
+
+    # 7. Embedding queue depth with failed count and oldest age
+    pending_dir = MEMORY_DIR / "pending_embeddings"
+    failed_dir = MEMORY_DIR / "failed_embeddings"
+    try:
+        pending_count = 0
+        oldest_pending_age_mins = 0
+        failed_count = 0
+
+        if pending_dir.exists():
+            pending_files = list(pending_dir.glob("*.pending"))
+            pending_count = len(pending_files)
+
+            # Find oldest pending file age
+            if pending_files:
+                import os
+                now = datetime.utcnow().timestamp()
+                oldest_mtime = min(os.path.getmtime(f) for f in pending_files)
+                oldest_pending_age_mins = int((now - oldest_mtime) / 60)
+
+        if failed_dir.exists():
+            failed_count = len(list(failed_dir.glob("*.failed")))
+
+        # Queue is concerning if: >100 pending, or oldest >30 mins, or any failed
+        queue_warning = pending_count > 100 or oldest_pending_age_mins > 30 or failed_count > 0
+        queue_error = pending_count > 500 or oldest_pending_age_mins > 120
+
+        if queue_error:
+            status = "error"
+        elif queue_warning:
+            status = "warning"
+        else:
+            status = "ok"
+
+        checks["embedding_queue"] = {
+            "status": status,
+            "pending": pending_count,
+            "failed": failed_count,
+            "oldest_pending_age_mins": oldest_pending_age_mins
+        }
+
+        if pending_count > 100:
+            issues.append(f"Embedding queue backlog: {pending_count} pending")
+        if oldest_pending_age_mins > 30:
+            issues.append(f"Embedding queue stale: oldest item {oldest_pending_age_mins} mins old")
+        if failed_count > 0:
+            issues.append(f"Embedding queue has {failed_count} failed items")
+
+    except Exception as e:
+        checks["embedding_queue"] = {"status": "error", "message": str(e)}
+        issues.append(f"Embedding queue check error: {e}")
+
+    # Overall status
+    has_errors = any(c.get("status") == "error" for c in checks.values())
+    has_warnings = any(c.get("status") == "warning" for c in checks.values())
+
+    return {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "overall": "error" if has_errors else ("warning" if has_warnings else "ok"),
+        "checks": checks,
+        "issues": issues
+    }
+
+
+# Run health check at startup and log any issues
+_health_result = _startup_health_check()
+if _health_result["issues"]:
+    print(f"[WARN] Startup health check found issues:", file=sys.stderr)
+    for issue in _health_result["issues"]:
+        print(f"  - {issue}", file=sys.stderr)
+else:
+    print(f"[INFO] Startup health check passed", file=sys.stderr)
+
 
 # Initialize orchestrator
 orchestrator = Orchestrator(MEMORY_DIR, rules, skills, artifact_store)
@@ -336,6 +593,20 @@ async def list_tools() -> list[Tool]:
                 "properties": {}
             }
         ),
+        Tool(
+            name="duro_health_check",
+            description="Run health diagnostics on Duro system. Checks: SQLite integrity, index sync, audit chain, disk space, embedding queue. Use this to diagnose issues before they become problems.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "verbose": {
+                        "type": "boolean",
+                        "description": "Include detailed check information",
+                        "default": False
+                    }
+                }
+            }
+        ),
 
         # Artifact tools (structured memory)
         Tool(
@@ -532,6 +803,40 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="duro_semantic_search",
+            description="Semantic search across artifacts using hybrid vector + keyword matching. Falls back gracefully to keyword-only if embeddings unavailable. Returns ranked results with optional score breakdown.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language search query"
+                    },
+                    "artifact_type": {
+                        "type": "string",
+                        "enum": ["fact", "decision", "episode", "evaluation", "skill_stats", "log"],
+                        "description": "Filter by artifact type"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Filter by tags (any match)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return",
+                        "default": 20
+                    },
+                    "explain": {
+                        "type": "boolean",
+                        "description": "Include score breakdown for debugging/tuning",
+                        "default": False
+                    }
+                },
+                "required": ["query"]
+            }
+        ),
+        Tool(
             name="duro_get_artifact",
             description="Retrieve full artifact by ID. Returns complete JSON envelope.",
             inputSchema={
@@ -570,6 +875,26 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {}
+            }
+        ),
+        Tool(
+            name="duro_run_migration",
+            description="Run database migrations to add new features (e.g., vector search tables). Safe to run multiple times - migrations are idempotent.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "migration_id": {
+                        "type": "string",
+                        "description": "Specific migration to run (e.g., '001_add_vectors'). If omitted, runs all pending migrations.",
+                        "default": None
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["up", "status"],
+                        "description": "up = apply migration, status = check status without applying",
+                        "default": "status"
+                    }
+                }
             }
         ),
         Tool(
@@ -1208,6 +1533,69 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 """
             return [TextContent(type="text", text=result)]
 
+        elif name == "duro_health_check":
+            verbose = arguments.get("verbose", False)
+            health = _startup_health_check()
+
+            # Build output
+            status_icons = {"ok": "✅", "warning": "⚠️", "error": "❌"}
+            overall_icon = status_icons.get(health["overall"], "❓")
+
+            lines = [f"## Duro Health Check {overall_icon}\n"]
+            lines.append(f"**Timestamp:** {health['timestamp']}")
+            lines.append(f"**Overall Status:** {health['overall'].upper()}\n")
+
+            lines.append("### Checks\n")
+            for check_name, check_data in health["checks"].items():
+                icon = status_icons.get(check_data.get("status"), "❓")
+                status = check_data.get("status", "unknown")
+                lines.append(f"- **{check_name}**: {icon} {status}")
+
+                if verbose:
+                    # Show detailed info for each check
+                    for key, value in check_data.items():
+                        if key != "status":
+                            lines.append(f"  - {key}: {value}")
+
+            if health["issues"]:
+                lines.append("\n### Issues Found\n")
+                for issue in health["issues"]:
+                    lines.append(f"- {issue}")
+
+            # Verbose mode: add artifact types breakdown for drift debugging
+            if verbose:
+                lines.append("\n### Artifact Types Breakdown\n")
+                from schemas import TYPE_DIRECTORIES
+                for type_name, dir_name in TYPE_DIRECTORIES.items():
+                    type_dir = MEMORY_DIR / dir_name
+                    if type_dir.exists():
+                        file_count = len(list(type_dir.glob("*.json")))
+                        indexed_count = artifact_store.index.count(type_name)
+                        drift = abs(file_count - indexed_count)
+                        drift_marker = " ⚠️" if drift > 0 else ""
+                        lines.append(f"- **{type_name}**: {file_count} files, {indexed_count} indexed{drift_marker}")
+                    else:
+                        lines.append(f"- **{type_name}**: (dir not created)")
+
+                # Add search capabilities
+                lines.append("\n### Search Capabilities\n")
+                search_caps = artifact_store.index.get_search_capabilities()
+                lines.append(f"- **Mode:** {search_caps['mode']}")
+                lines.append(f"- **FTS5:** {'✅' if search_caps['fts_available'] else '❌'}")
+                lines.append(f"- **Vector Search:** {'✅' if search_caps['vector_available'] else '❌'}")
+                lines.append(f"- **Embeddings:** {search_caps['embedding_count']}")
+
+                # Add embedding model status
+                from embeddings import get_embedding_status
+                emb_status = get_embedding_status()
+                lines.append(f"- **Embedding Model:** {emb_status['model_name'] or 'Not available'}")
+                lines.append(f"- **Model Loaded:** {'✅' if emb_status['model_loaded'] else '❌'}")
+
+            if not health["issues"] and not verbose:
+                lines.append("\n*All systems operational. Use verbose=true for details.*")
+
+            return [TextContent(type="text", text="\n".join(lines))]
+
         # Artifact tools
         elif name == "duro_store_fact":
             success, artifact_id, path = artifact_store.store_fact(
@@ -1294,6 +1682,52 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 text = "No artifacts found matching query."
             return [TextContent(type="text", text=text)]
 
+        elif name == "duro_semantic_search":
+            query = arguments["query"]
+            artifact_type = arguments.get("artifact_type")
+            tags = arguments.get("tags")
+            limit = arguments.get("limit", 20)
+            explain = arguments.get("explain", False)
+
+            # Get query embedding if available
+            from embeddings import embed_text, is_embedding_available
+            query_embedding = None
+            if is_embedding_available():
+                query_embedding = embed_text(query)
+
+            # Run hybrid search
+            search_result = artifact_store.index.hybrid_search(
+                query=query,
+                query_embedding=query_embedding,
+                artifact_type=artifact_type,
+                tags=tags,
+                limit=limit,
+                explain=explain
+            )
+
+            results = search_result["results"]
+            mode = search_result["mode"]
+
+            text = f"## Semantic Search Results\n\n"
+            text += f"**Mode:** {mode} | **Query:** \"{query}\"\n"
+            text += f"**Candidates:** {search_result['total_candidates']} (FTS: {search_result['fts_count']}, Vec: {search_result['vector_count']})\n\n"
+
+            if results:
+                for r in results:
+                    score = r["search_score"]
+                    text += f"- **{r['id']}** [{r['type']}] (score: {score:.3f})\n"
+                    text += f"  {r['title']}\n"
+                    if explain and "score_components" in r:
+                        sc = r["score_components"]
+                        text += f"  _Components: rrf={sc['rrf_base']:.3f}, type={sc['type_weight']:.2f}, recency={sc['recency_boost']:.3f}_\n"
+                        if r.get("explain"):
+                            text += f"  _Explain: {r['explain']}_\n"
+                    text += "\n"
+            else:
+                text += "No results found.\n"
+
+            return [TextContent(type="text", text=text)]
+
         elif name == "duro_get_artifact":
             artifact_id = arguments["artifact_id"]
             artifact = artifact_store.get_artifact(artifact_id)
@@ -1319,6 +1753,67 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         elif name == "duro_reindex":
             success_count, error_count = artifact_store.reindex()
             text = f"Reindex complete.\n- Indexed: {success_count}\n- Errors: {error_count}"
+            return [TextContent(type="text", text=text)]
+
+        elif name == "duro_run_migration":
+            action = arguments.get("action", "status")
+            migration_id = arguments.get("migration_id")  # Optional: specific migration
+
+            from migrations.runner import get_status, run_all_pending, run_migration
+
+            migrations_dir = Path(__file__).parent / "migrations"
+            db_path = str(MEMORY_DIR / "artifacts.db")
+
+            if action == "status":
+                status = get_status(migrations_dir, db_path)
+                text = "## Migration Status\n\n"
+
+                if status["applied"]:
+                    text += "### Applied\n"
+                    for m in status["applied"]:
+                        text += f"- ✅ **{m['migration_id']}** ({m['applied_at'][:10]})\n"
+                else:
+                    text += "No migrations applied yet.\n"
+
+                if status["pending"]:
+                    text += "\n### Pending\n"
+                    for m in status["pending"]:
+                        text += f"- ⏳ **{m['migration_id']}**\n"
+
+                if status["modified"]:
+                    text += "\n### ⚠️ Modified Since Applied\n"
+                    for m in status["modified"]:
+                        text += f"- **{m['migration_id']}** (checksum changed)\n"
+
+            elif action == "up":
+                if migration_id:
+                    # Run specific migration
+                    migration_path = migrations_dir / f"m{migration_id}.py"
+                    if not migration_path.exists():
+                        migration_path = migrations_dir / f"{migration_id}.py"
+                    if not migration_path.exists():
+                        return [TextContent(type="text", text=f"Migration not found: {migration_id}")]
+
+                    result = run_migration(db_path, migration_path)
+                    text = f"## Migration: {result['migration_id']}\n\n"
+                    text += f"- **Success:** {'✅' if result['success'] else '❌'}\n"
+                    text += f"- **Message:** {result['message']}\n"
+                    if result.get("details"):
+                        text += f"- **Details:** {result['details']}\n"
+                else:
+                    # Run all pending
+                    result = run_all_pending(migrations_dir, db_path)
+                    text = "## Migration Run\n\n"
+                    text += f"- **Success:** {'✅' if result['success'] else '❌'}\n"
+                    if result["applied"]:
+                        text += f"- **Applied:** {', '.join(result['applied'])}\n"
+                    if result["skipped"]:
+                        text += f"- **Skipped:** {', '.join(result['skipped'])}\n"
+                    if result["failed"]:
+                        text += f"- **Failed:** {', '.join(result['failed'])}\n"
+            else:
+                text = f"Unknown action: {action}. Use 'status' or 'up'."
+
             return [TextContent(type="text", text=text)]
 
         elif name == "duro_delete_artifact":
