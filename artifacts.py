@@ -745,6 +745,7 @@ class ArtifactStore:
                 "links": {
                     "facts_created": [],
                     "decisions_created": [],
+                    "decisions_used": [],
                     "skills_used": [],
                     "evaluation_id": None
                 },
@@ -915,6 +916,39 @@ class ArtifactStore:
                     }
                     auto_updates[update_type].append(update_item)
 
+        # Auto-generate decision updates based on episode result
+        # Decisions are hypotheses that survive contact with reality
+        decisions_created = episode_data.get("links", {}).get("decisions_created", [])
+        decisions_used = episode_data.get("links", {}).get("decisions_used", [])
+        # De-duplicate: a decision in both lists gets one update only
+        all_decisions = set(decisions_created) | set(decisions_used)
+
+        if all_decisions:
+            # Deltas for decisions (smaller than skills - decisions are higher-level)
+            if episode_result == "success":
+                decision_delta = 0.005
+                decision_update_type = "reinforce"
+            elif episode_result == "partial":
+                decision_delta = 0.002
+                decision_update_type = "reinforce"
+            elif episode_result == "failed":
+                decision_delta = -0.01  # negative: stronger penalty for bad decisions
+                decision_update_type = "decay"
+            else:
+                decision_delta = None
+                decision_update_type = None
+
+            if decision_delta is not None and decision_update_type:
+                for decision_id in all_decisions:
+                    update_item = {
+                        "type": "decision",
+                        "id": decision_id,
+                        "delta": decision_delta,
+                        "reason": f"auto: episode {episode_result}",
+                        "auto_generated": True
+                    }
+                    auto_updates[decision_update_type].append(update_item)
+
         # Merge user-provided updates with auto-generated ones
         final_updates = {"reinforce": [], "decay": []}
 
@@ -933,7 +967,7 @@ class ArtifactStore:
                 "raw": item
             })
 
-        # Merge user-provided updates (guardrail: filter to skills_used only for skill_stats)
+        # Merge user-provided updates (guardrail: filter to allowed items only)
         if memory_updates:
             for item in memory_updates.get("reinforce", []):
                 item_id = item.get("id") or item.get("artifact_id", "")
@@ -943,6 +977,11 @@ class ArtifactStore:
                     skill_id = item_id.replace("ss_", "")
                     if skill_id not in skills_used and item_id not in skills_used:
                         _guardrail_skip(item, "skill_stats update blocked: not in episode.links.skills_used")
+                        continue
+                # Guardrail: if it's a decision update, verify it's in all_decisions
+                if item_type == "decision" or item_id.startswith("decision_"):
+                    if item_id not in all_decisions:
+                        _guardrail_skip(item, "decision update blocked: not in episode.links.decisions_created or decisions_used")
                         continue
                 final_updates["reinforce"].append(item)
 
@@ -954,6 +993,11 @@ class ArtifactStore:
                     skill_id = item_id.replace("ss_", "")
                     if skill_id not in skills_used and item_id not in skills_used:
                         _guardrail_skip(item, "skill_stats decay blocked: not in episode.links.skills_used")
+                        continue
+                # Guardrail: if it's a decision update, verify it's in all_decisions
+                if item_type == "decision" or item_id.startswith("decision_"):
+                    if item_id not in all_decisions:
+                        _guardrail_skip(item, "decision decay blocked: not in episode.links.decisions_created or decisions_used")
                         continue
                 final_updates["decay"].append(item)
 
@@ -1342,6 +1386,20 @@ class ArtifactStore:
             data["confidence"] = new_confidence
         elif artifact_type == "decision":
             data["outcome"]["confidence"] = new_confidence
+            now = utc_now_iso()
+            # Deterministic status rules based on confidence thresholds
+            old_status = data["outcome"].get("status", "unverified")
+            if new_confidence >= 0.7:
+                data["outcome"]["status"] = "validated"
+                # Only set verified_at when actually becoming validated
+                if old_status != "validated":
+                    data["outcome"]["verified_at"] = now
+            elif new_confidence <= 0.3:
+                data["outcome"]["status"] = "reversed"
+            else:
+                data["outcome"]["status"] = "unverified"
+            # Always track when last evaluated
+            data["outcome"]["last_evaluated_at"] = now
 
         artifact["data"] = data
         artifact["updated_at"] = utc_now_iso()

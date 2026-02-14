@@ -459,6 +459,7 @@ EPISODE_DATA_SCHEMA = {
             "properties": {
                 "facts_created": {"type": "array", "items": {"type": "string"}},
                 "decisions_created": {"type": "array", "items": {"type": "string"}},
+                "decisions_used": {"type": "array", "items": {"type": "string"}},
                 "skills_used": {"type": "array", "items": {"type": "string"}},
                 "evaluation_id": {"type": ["string", "null"]}
             },

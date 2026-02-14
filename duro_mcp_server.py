@@ -1332,10 +1332,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "links": {
                         "type": "object",
-                        "description": "References to artifacts created during this episode",
+                        "description": "References to artifacts created/used during this episode",
                         "properties": {
                             "facts_created": {"type": "array", "items": {"type": "string"}},
                             "decisions_created": {"type": "array", "items": {"type": "string"}},
+                            "decisions_used": {"type": "array", "items": {"type": "string"}},
                             "skills_used": {"type": "array", "items": {"type": "string"}}
                         }
                     }

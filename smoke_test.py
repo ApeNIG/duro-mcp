@@ -523,6 +523,107 @@ def run_smoke_tests():
         all_passed = False
 
     # =========================================================
+    # TEST 6: Decision Outcomes via Evaluation (Auto-Update)
+    # =========================================================
+    print("\n--- TEST 6: Decision Outcomes via Evaluation (Auto-Update) ---\n")
+
+    # Create a decision to be used in an episode
+    success, dec_id6, _ = store.store_decision(
+        decision="Use semantic search for improved recall",
+        rationale="Hybrid FTS + embeddings provides best of both worlds",
+        context="smoke test auto decision outcomes",
+        alternatives=["FTS only", "embeddings only"],
+        tags=["smoke-test", "decision-auto-outcome"],
+        reversible=True,
+        sensitivity="internal"
+    )
+    if not success:
+        log(f"Failed to create decision: {dec_id6}", "FAIL")
+        return False
+    log(f"Created decision: {dec_id6}")
+
+    # Get initial confidence
+    dec_before = store.get_artifact(dec_id6)
+    initial_conf6 = dec_before["data"].get("outcome", {}).get("confidence", 0.5)
+    log(f"Initial decision confidence: {initial_conf6}")
+
+    # Create episode that USES this decision (decisions_used, not decisions_created)
+    success, ep_id6, _ = store.store_episode(
+        goal="Smoke test - decision auto-outcome via evaluation",
+        plan=["Apply decision", "Measure results"],
+        tags=["smoke-test", "decision-auto-outcome"],
+        context={"testing_auto_decision_outcome": True}
+    )
+    if not success:
+        log(f"Failed to create episode: {ep_id6}", "FAIL")
+        return False
+    log(f"Created episode: {ep_id6}")
+
+    # Close episode with decisions_used (past decision relied upon)
+    success, msg = store.update_episode(ep_id6, {
+        "status": "closed",
+        "result": "success",
+        "result_summary": "Semantic search improved recall as expected",
+        "links": {"skills_used": ["planning"], "decisions_used": [dec_id6]}
+    })
+    if not success:
+        log(f"Failed to close episode: {msg}", "FAIL")
+        return False
+    log("Closed episode with decisions_used")
+
+    # Create evaluation - should auto-generate decision update
+    success, eval_id6, _ = store.store_evaluation(
+        episode_id=ep_id6,
+        rubric={
+            "outcome_quality": {"score": 5, "notes": "Decision proved correct"},
+            "cost": {"tools_used": 1, "duration_mins": 0.1, "tokens_bucket": "XS"},
+            "correctness_risk": {"score": 0, "notes": "Verified outcome"},
+            "reusability": {"score": 5, "notes": "Pattern reusable"},
+            "reproducibility": {"score": 5, "notes": "Deterministic"}
+        },
+        grade="A"
+        # Let auto_skill_updates and auto decision updates happen
+    )
+    if not success:
+        log(f"Failed to create evaluation: {eval_id6}", "FAIL")
+        return False
+    log(f"Created evaluation: {eval_id6}")
+
+    # Check that decision update was auto-generated
+    eval_artifact6 = store.get_artifact(eval_id6)
+    reinforce_items6 = eval_artifact6["data"]["memory_updates"]["reinforce"]
+    decision_ids_in_updates = [item.get("id") for item in reinforce_items6 if item.get("type") == "decision"]
+
+    if dec_id6 in decision_ids_in_updates:
+        log(f"Auto-generated decision update for {dec_id6}", "PASS")
+    else:
+        log(f"Decision update NOT auto-generated (expected {dec_id6})", "FAIL")
+        all_passed = False
+
+    # Apply evaluation
+    success, msg, applied = store.apply_evaluation(eval_id6)
+    if not success:
+        log(f"Apply failed: {msg}", "FAIL")
+        all_passed = False
+    else:
+        log(f"Applied evaluation: {msg}")
+
+    # Verify decision confidence increased (+0.005 for success)
+    dec_after6 = store.get_artifact(dec_id6)
+    final_conf6 = dec_after6["data"]["outcome"]["confidence"]
+    expected_conf6 = initial_conf6 + 0.005
+
+    if not assert_close(final_conf6, expected_conf6, 0.0001, "Decision confidence after success"):
+        all_passed = False
+
+    # Verify status is still "unverified" (below 0.7 threshold)
+    status6 = dec_after6["data"]["outcome"]["status"]
+    if status6 == "unverified":
+        log(f"Decision status is 'unverified' (confidence {final_conf6} < 0.7)", "PASS")
+    else:
+        log(f"Decision status unexpected: {status6}", "WARN")
+
+    # =========================================================
     # SUMMARY
     # =========================================================
     print("\n" + "="*60)
