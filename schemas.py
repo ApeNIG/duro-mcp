@@ -128,6 +128,17 @@ FACT_DATA_SCHEMA = {
             "type": "boolean",
             "default": False,
             "description": "If true, fact never decays"
+        },
+        # Reinforcement fields (Phase 4)
+        "last_reinforced_at": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "When this fact was last used or confirmed (ISO datetime)"
+        },
+        "reinforcement_count": {
+            "type": "integer",
+            "default": 0,
+            "description": "How many times this fact has been reinforced"
         }
     }
 }
@@ -727,6 +738,8 @@ def apply_backward_compat_defaults(artifact: dict[str, Any]) -> dict[str, Any]:
             data["usage_count"] = 0
         if "reinforcement_count" not in data:
             data["reinforcement_count"] = 0
+        if "last_reinforced_at" not in data:
+            data["last_reinforced_at"] = None  # Never reinforced yet
 
     elif artifact_type == "decision":
         # Outcome defaults

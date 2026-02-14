@@ -79,12 +79,17 @@ class ArtifactIndex:
             importance = data.get("importance", 0.5)
             pinned = 1 if data.get("pinned", False) else 0
 
+            # Extract reinforcement fields (Phase 4)
+            last_reinforced_at = data.get("last_reinforced_at")
+            reinforcement_count = data.get("reinforcement_count", 0)
+
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
                     INSERT INTO artifacts (id, type, created_at, updated_at, sensitivity,
                                           title, tags, source_workflow, source_urls, file_path, hash,
-                                          valid_from, valid_until, superseded_by, importance, pinned)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                          valid_from, valid_until, superseded_by, importance, pinned,
+                                          last_reinforced_at, reinforcement_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         updated_at = excluded.updated_at,
                         sensitivity = excluded.sensitivity,
@@ -97,7 +102,9 @@ class ArtifactIndex:
                         valid_until = excluded.valid_until,
                         superseded_by = excluded.superseded_by,
                         importance = excluded.importance,
-                        pinned = excluded.pinned
+                        pinned = excluded.pinned,
+                        last_reinforced_at = excluded.last_reinforced_at,
+                        reinforcement_count = excluded.reinforcement_count
                 """, (
                     artifact["id"],
                     artifact["type"],
@@ -114,7 +121,9 @@ class ArtifactIndex:
                     valid_until,
                     superseded_by,
                     importance,
-                    pinned
+                    pinned,
+                    last_reinforced_at,
+                    reinforcement_count
                 ))
                 conn.commit()
             return True

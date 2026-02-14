@@ -1,0 +1,12 @@
+# Duro MCP Server Dependencies
+# =============================
+
+# Core MCP
+mcp>=1.0.0
+
+# Optional: Semantic search (graceful degradation if missing)
+# fastembed>=0.2.0
+# sqlite-vec>=0.1.0
+
+# Development
+pytest>=7.0.0

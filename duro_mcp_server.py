@@ -708,6 +708,88 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
+        # Decay & Maintenance tools (Phase 4)
+        Tool(
+            name="duro_apply_decay",
+            description="Apply time-based confidence decay to unreinforced facts. Pinned facts are never decayed. Run with dry_run=true first to preview changes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, calculate decay but don't modify facts",
+                        "default": True
+                    },
+                    "min_importance": {
+                        "type": "number",
+                        "description": "Only decay facts with importance >= this value",
+                        "default": 0
+                    },
+                    "include_stale_report": {
+                        "type": "boolean",
+                        "description": "Include list of stale high-importance facts",
+                        "default": True
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="duro_reembed",
+            description="Re-queue artifacts for embedding. Use after model upgrade, schema change, or to fix bad embeddings.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "artifact_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Specific artifact IDs to re-embed (if not specified, uses filters)"
+                    },
+                    "artifact_type": {
+                        "type": "string",
+                        "description": "Re-embed all artifacts of this type"
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "description": "Re-embed ALL artifacts (use with caution)",
+                        "default": False
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="duro_maintenance_report",
+            description="Generate a maintenance report for memory health. Shows: total facts, % pinned, % stale, top stale high-importance facts, embedding/FTS coverage.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "include_stale_list": {
+                        "type": "boolean",
+                        "description": "Include list of top stale high-importance facts",
+                        "default": True
+                    },
+                    "top_n_stale": {
+                        "type": "integer",
+                        "description": "Number of stale facts to list",
+                        "default": 10
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="duro_reinforce_fact",
+            description="Reinforce a fact - mark it as recently used/confirmed. Resets decay clock and increments reinforcement count.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "fact_id": {
+                        "type": "string",
+                        "description": "The fact ID to reinforce"
+                    }
+                },
+                "required": ["fact_id"]
+            }
+        ),
+
         # Artifact tools (structured memory)
         Tool(
             name="duro_store_fact",
@@ -1816,6 +1898,145 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 lines.append("*No learnings, facts, or decisions detected in the text.*")
 
             text = "\n".join(lines)
+            return [TextContent(type="text", text=text)]
+
+        # Decay & Maintenance tools (Phase 4)
+        elif name == "duro_apply_decay":
+            from decay import apply_batch_decay, DecayConfig, DEFAULT_DECAY_CONFIG
+
+            dry_run = arguments.get("dry_run", True)
+            min_importance = arguments.get("min_importance", 0)
+            include_stale_report = arguments.get("include_stale_report", True)
+
+            # Load all facts
+            facts = artifact_store.query(artifact_type="fact", limit=10000)
+            full_facts = [artifact_store.get_artifact(f["id"]) for f in facts]
+            full_facts = [f for f in full_facts if f is not None]
+
+            # Filter by importance if specified
+            if min_importance > 0:
+                full_facts = [f for f in full_facts if f.get("data", {}).get("importance", 0.5) >= min_importance]
+
+            # Apply decay
+            result = apply_batch_decay(full_facts, DEFAULT_DECAY_CONFIG, dry_run=dry_run)
+
+            # Save changes if not dry run
+            if not dry_run:
+                for fact in full_facts:
+                    artifact_store._save_artifact(fact)
+
+            lines = ["## Decay Results\n"]
+            lines.append(f"**Mode:** {'DRY RUN' if dry_run else 'APPLIED'}")
+            lines.append(f"**Total facts:** {result.total_facts}")
+            lines.append(f"**Decayed:** {result.decayed_count}")
+            lines.append(f"**Skipped (pinned):** {result.skipped_pinned}")
+            lines.append(f"**Skipped (grace period):** {result.skipped_grace_period}")
+            lines.append(f"**Skipped (reinforcement):** {result.skipped_reinforcement}")
+            lines.append(f"**Now stale:** {result.stale_count}\n")
+
+            if include_stale_report and result.stale_count > 0:
+                lines.append("### Stale Facts (top 10)\n")
+                stale = [r for r in result.results if r.get("stale")][:10]
+                for s in stale:
+                    lines.append(f"- `{s['id']}` conf: {s['new_confidence']:.3f} (was {s['old_confidence']:.3f})")
+
+            text = "\n".join(lines)
+            return [TextContent(type="text", text=text)]
+
+        elif name == "duro_reembed":
+            from embedding_worker import queue_for_embedding
+
+            artifact_ids = arguments.get("artifact_ids")
+            artifact_type = arguments.get("artifact_type")
+            all_artifacts = arguments.get("all", False)
+
+            queued = []
+
+            if artifact_ids:
+                # Specific IDs
+                for aid in artifact_ids:
+                    queue_for_embedding(aid)
+                    queued.append(aid)
+            elif artifact_type:
+                # All of a type
+                results = artifact_store.query(artifact_type=artifact_type, limit=10000)
+                for r in results:
+                    queue_for_embedding(r["id"])
+                    queued.append(r["id"])
+            elif all_artifacts:
+                # Everything
+                results = artifact_store.query(limit=10000)
+                for r in results:
+                    queue_for_embedding(r["id"])
+                    queued.append(r["id"])
+            else:
+                return [TextContent(type="text", text="No artifacts specified. Use artifact_ids, artifact_type, or all=true.")]
+
+            text = f"## Re-embed Queued\n\n**Queued:** {len(queued)} artifacts for re-embedding.\n\nThe embedding worker will process these in the background."
+            return [TextContent(type="text", text=text)]
+
+        elif name == "duro_maintenance_report":
+            from decay import generate_maintenance_report, DEFAULT_DECAY_CONFIG
+
+            include_stale_list = arguments.get("include_stale_list", True)
+            top_n_stale = arguments.get("top_n_stale", 10)
+
+            # Load all facts
+            facts = artifact_store.query(artifact_type="fact", limit=10000)
+            full_facts = [artifact_store.get_artifact(f["id"]) for f in facts]
+            full_facts = [f for f in full_facts if f is not None]
+
+            # Generate report
+            report = generate_maintenance_report(full_facts, DEFAULT_DECAY_CONFIG, top_n_stale)
+
+            # Get embedding/FTS coverage
+            fts_stats = artifact_store.index.get_fts_completeness()
+            emb_stats = artifact_store.index.get_embedding_stats()
+
+            lines = ["## Maintenance Report\n"]
+            lines.append("### Fact Health\n")
+            lines.append(f"- **Total facts:** {report.total_facts}")
+            lines.append(f"- **Pinned:** {report.pinned_count} ({report.pinned_pct}%)")
+            lines.append(f"- **Stale:** {report.stale_count} ({report.stale_pct}%)")
+            lines.append(f"- **Avg confidence:** {report.avg_confidence}")
+            lines.append(f"- **Avg importance:** {report.avg_importance}")
+            lines.append(f"- **Avg reinforcement count:** {report.avg_reinforcement_count}")
+            lines.append(f"- **Oldest unreinforced:** {report.oldest_unreinforced_days} days\n")
+
+            lines.append("### Index Coverage\n")
+            fts_coverage = fts_stats.get("coverage_pct", 0)
+            emb_coverage = emb_stats.get("coverage_pct", 0)
+            lines.append(f"- **FTS coverage:** {fts_coverage}%")
+            lines.append(f"- **Embedding coverage:** {emb_coverage}%\n")
+
+            if include_stale_list and report.top_stale_high_importance:
+                lines.append("### Top Stale High-Importance Facts\n")
+                for fact in report.top_stale_high_importance:
+                    lines.append(f"- `{fact['id']}` imp={fact['importance']}, conf={fact['confidence']:.3f}")
+                    lines.append(f"  - {fact['claim'][:80]}...")
+                    lines.append(f"  - Inactive: {fact['days_inactive']} days")
+
+            text = "\n".join(lines)
+            return [TextContent(type="text", text=text)]
+
+        elif name == "duro_reinforce_fact":
+            from decay import reinforce_fact
+
+            fact_id = arguments["fact_id"]
+            fact = artifact_store.get_artifact(fact_id)
+
+            if not fact:
+                return [TextContent(type="text", text=f"Fact not found: {fact_id}")]
+
+            if fact.get("type") != "fact":
+                return [TextContent(type="text", text=f"Artifact {fact_id} is not a fact (type: {fact.get('type')})")]
+
+            # Reinforce
+            updated_fact = reinforce_fact(fact)
+            artifact_store._save_artifact(updated_fact)
+
+            data = updated_fact.get("data", {})
+            text = f"## Fact Reinforced\n\n- **ID:** `{fact_id}`\n- **Reinforcement count:** {data.get('reinforcement_count', 0)}\n- **Last reinforced:** {data.get('last_reinforced_at')}"
             return [TextContent(type="text", text=text)]
 
         # Artifact tools
