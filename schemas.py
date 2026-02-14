@@ -101,6 +101,33 @@ FACT_DATA_SCHEMA = {
             "enum": ["web", "local_file", "user", "tool_output", "unknown"],
             "default": "unknown",
             "description": "Where the fact came from: web (URL), local_file, user (stated), tool_output, unknown"
+        },
+        # Temporal fields (Phase 2)
+        "valid_from": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "When this fact became true (ISO datetime)"
+        },
+        "valid_until": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "When this fact stopped being true (ISO datetime)"
+        },
+        "superseded_by": {
+            "type": ["string", "null"],
+            "description": "ID of fact that replaces this one"
+        },
+        "importance": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.5,
+            "description": "How important this fact is (affects decay rate)"
+        },
+        "pinned": {
+            "type": "boolean",
+            "default": False,
+            "description": "If true, fact never decays"
         }
     }
 }

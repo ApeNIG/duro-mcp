@@ -190,8 +190,11 @@ def down(db_path: str) -> dict:
         conn.execute("DROP TABLE IF EXISTS artifact_vectors")
         conn.execute("DROP TABLE IF EXISTS embedding_state")
 
-        # Remove migration record (from schema_migrations, managed by runner)
-        conn.execute("DELETE FROM schema_migrations WHERE migration_id = ?", (MIGRATION_ID,))
+        # Remove migration record (best-effort - table may not exist if called directly)
+        try:
+            conn.execute("DELETE FROM schema_migrations WHERE migration_id = ?", (MIGRATION_ID,))
+        except Exception:
+            pass  # Table doesn't exist or other issue - that's fine
 
         conn.commit()
         result["success"] = True

@@ -597,6 +597,68 @@ class ArtifactStore:
 
         return self._update_artifact_file(artifact)
 
+    def supersede_fact(
+        self,
+        old_fact_id: str,
+        new_fact_id: str,
+        reason: Optional[str] = None
+    ) -> tuple[bool, str]:
+        """
+        Mark an old fact as superseded by a new fact.
+
+        Updates the old fact's data:
+        - Sets valid_until to current time
+        - Sets superseded_by to new_fact_id
+        - Creates a 'supersedes' relation in artifact_relations
+
+        Args:
+            old_fact_id: The fact being superseded
+            new_fact_id: The fact that replaces it
+            reason: Optional explanation for the supersession
+
+        Returns (success, message).
+        """
+        # Get old fact
+        old_fact = self.get_artifact(old_fact_id)
+        if not old_fact:
+            return False, f"Old fact '{old_fact_id}' not found"
+
+        if old_fact.get("type") != "fact":
+            return False, f"Artifact '{old_fact_id}' is not a fact"
+
+        # Get new fact (verify it exists)
+        new_fact = self.get_artifact(new_fact_id)
+        if not new_fact:
+            return False, f"New fact '{new_fact_id}' not found"
+
+        if new_fact.get("type") != "fact":
+            return False, f"Artifact '{new_fact_id}' is not a fact"
+
+        # Check not already superseded
+        if old_fact["data"].get("superseded_by"):
+            return False, f"Fact '{old_fact_id}' is already superseded by '{old_fact['data']['superseded_by']}'"
+
+        # Update old fact
+        now = utc_now_iso()
+        old_fact["data"]["valid_until"] = now
+        old_fact["data"]["superseded_by"] = new_fact_id
+        old_fact["updated_at"] = now
+
+        # Save old fact
+        success, msg = self._update_artifact_file(old_fact)
+        if not success:
+            return False, f"Failed to update old fact: {msg}"
+
+        # Add relation to index
+        self.index.add_relation(
+            source_id=new_fact_id,
+            target_id=old_fact_id,
+            relation="supersedes",
+            metadata={"reason": reason} if reason else None
+        )
+
+        return True, f"Fact '{old_fact_id}' superseded by '{new_fact_id}'"
+
     def store_log(
         self,
         event_type: str,
@@ -1447,10 +1509,12 @@ class ArtifactStore:
                     print(f"Reindex error for {file_path}: {e}")
                     errors += 1
 
-        # Rebuild FTS semantic text (triggers can't populate this)
-        fts_result = self.index.rebuild_fts()
-        if not fts_result.get("success"):
-            print(f"FTS rebuild warning: {fts_result}")
+        # Conditionally rebuild FTS semantic text (only if needed)
+        fts_status = self.index.get_fts_completeness()
+        if fts_status.get("fts_exists") and fts_status.get("missing_text_count", 0) > 0:
+            fts_result = self.index.rebuild_fts()
+            if not fts_result.get("success"):
+                print(f"FTS rebuild warning: {fts_result}")
 
         return success, errors
 

@@ -610,6 +610,54 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
+        # Temporal tools (Phase 2)
+        Tool(
+            name="duro_supersede_fact",
+            description="Mark an old fact as superseded by a new fact. Updates the old fact with valid_until and superseded_by. Use when information becomes outdated.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "old_fact_id": {
+                        "type": "string",
+                        "description": "The fact ID being superseded"
+                    },
+                    "new_fact_id": {
+                        "type": "string",
+                        "description": "The fact ID that replaces it"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional explanation for the supersession"
+                    }
+                },
+                "required": ["old_fact_id", "new_fact_id"]
+            }
+        ),
+        Tool(
+            name="duro_get_related",
+            description="Get artifacts related to a given artifact. Returns both explicit relations (supersedes, references) and optionally semantic neighbors.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "artifact_id": {
+                        "type": "string",
+                        "description": "The artifact to find relations for"
+                    },
+                    "relation_type": {
+                        "type": "string",
+                        "description": "Filter by relation type (e.g., 'supersedes', 'references')"
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["outgoing", "incoming", "both"],
+                        "description": "Direction of relations to include",
+                        "default": "both"
+                    }
+                },
+                "required": ["artifact_id"]
+            }
+        ),
+
         # Artifact tools (structured memory)
         Tool(
             name="duro_store_fact",
@@ -1597,6 +1645,44 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 lines.append("\n*All systems operational. Use verbose=true for details.*")
 
             return [TextContent(type="text", text="\n".join(lines))]
+
+        # Temporal tools (Phase 2)
+        elif name == "duro_supersede_fact":
+            old_fact_id = arguments["old_fact_id"]
+            new_fact_id = arguments["new_fact_id"]
+            reason = arguments.get("reason")
+
+            success, msg = artifact_store.supersede_fact(old_fact_id, new_fact_id, reason)
+
+            if success:
+                text = f"✅ {msg}"
+            else:
+                text = f"❌ {msg}"
+            return [TextContent(type="text", text=text)]
+
+        elif name == "duro_get_related":
+            artifact_id = arguments["artifact_id"]
+            relation_type = arguments.get("relation_type")
+            direction = arguments.get("direction", "both")
+
+            relations = artifact_store.index.get_relations(
+                artifact_id,
+                direction=direction,
+                relation_type=relation_type
+            )
+
+            if not relations:
+                text = f"No relations found for '{artifact_id}'."
+            else:
+                lines = [f"## Relations for {artifact_id}\n"]
+                for rel in relations:
+                    dir_icon = "→" if rel["direction"] == "outgoing" else "←"
+                    other_id = rel["target_id"] if rel["direction"] == "outgoing" else rel["source_id"]
+                    lines.append(f"- {dir_icon} **{rel['relation']}** {other_id}")
+                    if rel.get("metadata"):
+                        lines.append(f"  - {rel['metadata']}")
+                text = "\n".join(lines)
+            return [TextContent(type="text", text=text)]
 
         # Artifact tools
         elif name == "duro_store_fact":

@@ -72,11 +72,19 @@ class ArtifactIndex:
             source_urls = data.get("source_urls", [])
             source_urls_json = json.dumps(source_urls) if source_urls else None
 
+            # Extract temporal fields (for facts, but columns exist for all)
+            valid_from = data.get("valid_from")
+            valid_until = data.get("valid_until")
+            superseded_by = data.get("superseded_by")
+            importance = data.get("importance", 0.5)
+            pinned = 1 if data.get("pinned", False) else 0
+
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
                     INSERT INTO artifacts (id, type, created_at, updated_at, sensitivity,
-                                          title, tags, source_workflow, source_urls, file_path, hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                          title, tags, source_workflow, source_urls, file_path, hash,
+                                          valid_from, valid_until, superseded_by, importance, pinned)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         updated_at = excluded.updated_at,
                         sensitivity = excluded.sensitivity,
@@ -84,7 +92,12 @@ class ArtifactIndex:
                         tags = excluded.tags,
                         source_urls = excluded.source_urls,
                         file_path = excluded.file_path,
-                        hash = excluded.hash
+                        hash = excluded.hash,
+                        valid_from = excluded.valid_from,
+                        valid_until = excluded.valid_until,
+                        superseded_by = excluded.superseded_by,
+                        importance = excluded.importance,
+                        pinned = excluded.pinned
                 """, (
                     artifact["id"],
                     artifact["type"],
@@ -96,7 +109,12 @@ class ArtifactIndex:
                     source.get("workflow"),
                     source_urls_json,
                     file_path,
-                    file_hash
+                    file_hash,
+                    valid_from,
+                    valid_until,
+                    superseded_by,
+                    importance,
+                    pinned
                 ))
                 conn.commit()
             return True
@@ -141,6 +159,124 @@ class ArtifactIndex:
         except Exception as e:
             print(f"Index delete error: {e}")
             return False
+
+    def add_relation(
+        self,
+        source_id: str,
+        target_id: str,
+        relation: str,
+        confidence: float = 1.0,
+        metadata: Optional[dict] = None
+    ) -> bool:
+        """
+        Add a relationship between two artifacts.
+
+        Args:
+            source_id: The source artifact (e.g., new fact)
+            target_id: The target artifact (e.g., old fact)
+            relation: Type of relation (e.g., "supersedes", "references", "supports")
+            confidence: Confidence in this relation (0-1)
+            metadata: Optional JSON-serializable metadata
+
+        Returns True on success.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Check if relations table exists
+                cursor = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='artifact_relations'"
+                )
+                if not cursor.fetchone():
+                    # Table doesn't exist yet - migration not applied
+                    return True  # Silent success, relation just not tracked
+
+                metadata_json = json.dumps(metadata) if metadata else None
+                conn.execute("""
+                    INSERT OR REPLACE INTO artifact_relations
+                    (source_id, target_id, relation, confidence, created_at, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    source_id,
+                    target_id,
+                    relation,
+                    confidence,
+                    utc_now_iso(),
+                    metadata_json
+                ))
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"Add relation error: {e}")
+            return False
+
+    def get_relations(
+        self,
+        artifact_id: str,
+        direction: str = "both",
+        relation_type: Optional[str] = None
+    ) -> list[dict]:
+        """
+        Get relations for an artifact.
+
+        Args:
+            artifact_id: The artifact to find relations for
+            direction: "outgoing" (as source), "incoming" (as target), or "both"
+            relation_type: Filter by relation type (e.g., "supersedes")
+
+        Returns list of relation dicts.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Check if relations table exists
+                cursor = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='artifact_relations'"
+                )
+                if not cursor.fetchone():
+                    return []
+
+                conn.row_factory = sqlite3.Row
+                relations = []
+
+                if direction in ("outgoing", "both"):
+                    query = "SELECT * FROM artifact_relations WHERE source_id = ?"
+                    params = [artifact_id]
+                    if relation_type:
+                        query += " AND relation = ?"
+                        params.append(relation_type)
+                    cursor = conn.execute(query, params)
+                    for row in cursor:
+                        relations.append({
+                            "source_id": row["source_id"],
+                            "target_id": row["target_id"],
+                            "relation": row["relation"],
+                            "confidence": row["confidence"],
+                            "created_at": row["created_at"],
+                            "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
+                            "direction": "outgoing"
+                        })
+
+                if direction in ("incoming", "both"):
+                    query = "SELECT * FROM artifact_relations WHERE target_id = ?"
+                    params = [artifact_id]
+                    if relation_type:
+                        query += " AND relation = ?"
+                        params.append(relation_type)
+                    cursor = conn.execute(query, params)
+                    for row in cursor:
+                        relations.append({
+                            "source_id": row["source_id"],
+                            "target_id": row["target_id"],
+                            "relation": row["relation"],
+                            "confidence": row["confidence"],
+                            "created_at": row["created_at"],
+                            "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
+                            "direction": "incoming"
+                        })
+
+                return relations
+        except Exception as e:
+            print(f"Get relations error: {e}")
+            return []
 
     def query(
         self,
@@ -220,6 +356,80 @@ class ArtifactIndex:
                 return results
         except Exception as e:
             print(f"Index query error: {e}")
+            return []
+
+    def query_current_facts(
+        self,
+        tags: Optional[list[str]] = None,
+        search_text: Optional[str] = None,
+        min_importance: Optional[float] = None,
+        include_pinned: bool = True,
+        limit: int = 100
+    ) -> list[dict]:
+        """
+        Query facts that are currently valid (not superseded).
+
+        Args:
+            tags: Filter by tags
+            search_text: Search in title/claim
+            min_importance: Filter by importance >= this value
+            include_pinned: Include pinned facts regardless of filters
+            limit: Maximum results
+
+        Returns list of current (non-superseded) facts.
+        """
+        conditions = ["type = 'fact'", "superseded_by IS NULL"]
+        params = []
+
+        if tags:
+            tag_conditions = []
+            for tag in tags:
+                tag_conditions.append("tags LIKE ?")
+                params.append(f'%"{tag}"%')
+            conditions.append(f"({' OR '.join(tag_conditions)})")
+
+        if search_text:
+            conditions.append("title LIKE ?")
+            params.append(f"%{search_text}%")
+
+        if min_importance is not None:
+            conditions.append("(importance >= ? OR pinned = 1)")
+            params.append(min_importance)
+
+        where_clause = " AND ".join(conditions)
+
+        query = f"""
+            SELECT id, type, created_at, updated_at, sensitivity, title,
+                   tags, source_workflow, file_path, importance, pinned
+            FROM artifacts
+            WHERE {where_clause}
+            ORDER BY importance DESC, created_at DESC
+            LIMIT ?
+        """
+        params.append(limit)
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(query, params)
+                results = []
+                for row in cursor:
+                    results.append({
+                        "id": row["id"],
+                        "type": row["type"],
+                        "created_at": row["created_at"],
+                        "updated_at": row["updated_at"],
+                        "sensitivity": row["sensitivity"],
+                        "title": row["title"],
+                        "tags": json.loads(row["tags"]) if row["tags"] else [],
+                        "source_workflow": row["source_workflow"],
+                        "file_path": row["file_path"],
+                        "importance": row["importance"],
+                        "pinned": bool(row["pinned"])
+                    })
+                return results
+        except Exception as e:
+            print(f"Query current facts error: {e}")
             return []
 
     def get_by_id(self, artifact_id: str) -> Optional[dict]:
