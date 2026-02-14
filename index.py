@@ -364,10 +364,11 @@ class ArtifactIndex:
         search_text: Optional[str] = None,
         min_importance: Optional[float] = None,
         include_pinned: bool = True,
-        limit: int = 100
+        limit: int = 100,
+        as_of: Optional[str] = None
     ) -> list[dict]:
         """
-        Query facts that are currently valid (not superseded).
+        Query facts that are currently valid (not superseded AND within time bounds).
 
         Args:
             tags: Filter by tags
@@ -375,11 +376,23 @@ class ArtifactIndex:
             min_importance: Filter by importance >= this value
             include_pinned: Include pinned facts regardless of filters
             limit: Maximum results
+            as_of: Query as of this time (ISO string). Defaults to now.
 
-        Returns list of current (non-superseded) facts.
+        Returns list of current facts (not superseded, valid_from <= now, valid_until > now or NULL).
         """
-        conditions = ["type = 'fact'", "superseded_by IS NULL"]
-        params = []
+        now = as_of or utc_now_iso()
+
+        # Core temporal conditions:
+        # 1. Not superseded
+        # 2. valid_from is NULL (always valid) OR valid_from <= now (became valid)
+        # 3. valid_until is NULL (still valid) OR valid_until > now (not yet expired)
+        conditions = [
+            "type = 'fact'",
+            "superseded_by IS NULL",
+            "(valid_from IS NULL OR valid_from <= ?)",
+            "(valid_until IS NULL OR valid_until > ?)"
+        ]
+        params = [now, now]
 
         if tags:
             tag_conditions = []
