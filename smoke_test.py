@@ -41,9 +41,20 @@ def ensure_migrations_applied():
     """
     Check for pending migrations and auto-apply them.
     Returns (success, message).
+
+    Control with env var:
+      DURO_SMOKE_APPLY_MIGRATIONS=0  -> fail on pending (strict, good for CI)
+      DURO_SMOKE_APPLY_MIGRATIONS=1  -> auto-apply (default, good for dev)
     """
+    auto_apply = os.environ.get("DURO_SMOKE_APPLY_MIGRATIONS", "1") == "1"
+
     try:
-        from migrations.runner import get_pending_migrations, run_all_pending
+        # Import from migrations package (stable API)
+        from migrations import get_pending_migrations, run_all_pending
+
+        # Log migrations dir for debugging wrong-cwd issues
+        migration_files = list(MIGRATIONS_DIR.glob("m*.py"))
+        log(f"Migrations dir: {MIGRATIONS_DIR} ({len(migration_files)} files)")
 
         pending = get_pending_migrations(MIGRATIONS_DIR, str(DEFAULT_DB_PATH))
 
@@ -51,6 +62,11 @@ def ensure_migrations_applied():
             return True, "All migrations applied"
 
         pending_ids = [m["migration_id"] for m in pending]
+
+        if not auto_apply:
+            # Strict mode: fail with clear instructions
+            return False, f"Pending migrations: {pending_ids}. Run: python -m migrations.runner {DEFAULT_DB_PATH}"
+
         log(f"Pending migrations detected: {pending_ids}")
         log("Auto-applying migrations...")
 
@@ -62,6 +78,8 @@ def ensure_migrations_applied():
         else:
             return False, f"Migration failed: {result['failed']}"
 
+    except ImportError as e:
+        return False, f"Cannot import migrations module: {e}"
     except Exception as e:
         return False, f"Migration check error: {e}"
 
