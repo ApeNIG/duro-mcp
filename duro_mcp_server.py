@@ -1762,6 +1762,33 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             rule_summary = rules.get_rules_summary()
             artifact_stats = artifact_store.get_stats()
 
+            # Get embedding stats for visibility
+            emb_stats = artifact_store.index.get_embedding_stats()
+            pending_dir = MEMORY_DIR / "pending_embeddings"
+            pending_count = 0
+            oldest_pending_mins = 0
+            if pending_dir.exists():
+                pending_files = list(pending_dir.glob("*.pending"))
+                pending_count = len(pending_files)
+                if pending_files:
+                    import os
+                    now = utc_now().timestamp()
+                    oldest_mtime = min(os.path.getmtime(f) for f in pending_files)
+                    oldest_pending_mins = int((now - oldest_mtime) / 60)
+
+            # Embedding status indicator
+            emb_coverage = emb_stats.get('coverage_pct', 0)
+            if pending_count == 0 and emb_coverage >= 99:
+                emb_status = "✅"
+            elif pending_count > 100 or oldest_pending_mins > 30:
+                emb_status = "⚠️"
+            else:
+                emb_status = "🔄"
+
+            emb_lag_info = ""
+            if pending_count > 0:
+                emb_lag_info = f" ({pending_count} pending, oldest {oldest_pending_mins}m)"
+
             result = f"""## Duro System Status
 
 **Memory**
@@ -1775,6 +1802,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 - Total artifacts: {artifact_stats['total_artifacts']}
 - By type: {artifact_stats['by_type']}
 - By sensitivity: {artifact_stats['by_sensitivity']}
+
+**Embeddings** {emb_status}
+- Coverage: {emb_stats.get('embeddings_count', 0)}/{emb_stats.get('artifacts_count', 0)} ({emb_coverage:.1f}%){emb_lag_info}
 
 **Skills**
 - Total skills: {skill_summary['total_skills']}
