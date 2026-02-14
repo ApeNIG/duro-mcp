@@ -2016,8 +2016,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             return [TextContent(type="text", text=text)]
 
         elif name == "duro_reembed":
-            from embedding_worker import queue_for_embedding
+            from embedding_worker import EmbeddingQueue
 
+            embedding_queue = EmbeddingQueue(MEMORY_DIR)
             artifact_ids = arguments.get("artifact_ids")
             artifact_type = arguments.get("artifact_type")
             all_artifacts = arguments.get("all", False)
@@ -2027,19 +2028,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             if artifact_ids:
                 # Specific IDs
                 for aid in artifact_ids:
-                    queue_for_embedding(aid)
+                    embedding_queue.queue_for_embedding(aid)
                     queued.append(aid)
             elif artifact_type:
                 # All of a type
                 results = artifact_store.query(artifact_type=artifact_type, limit=10000)
                 for r in results:
-                    queue_for_embedding(r["id"])
+                    embedding_queue.queue_for_embedding(r["id"])
                     queued.append(r["id"])
             elif all_artifacts:
                 # Everything
                 results = artifact_store.query(limit=10000)
                 for r in results:
-                    queue_for_embedding(r["id"])
+                    embedding_queue.queue_for_embedding(r["id"])
                     queued.append(r["id"])
             else:
                 return [TextContent(type="text", text="No artifacts specified. Use artifact_ids, artifact_type, or all=true.")]
