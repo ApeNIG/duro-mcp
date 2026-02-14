@@ -16,6 +16,7 @@ from artifacts import ArtifactStore
 # Default paths (match duro_mcp_server.py)
 DEFAULT_MEMORY_DIR = Path(os.path.expanduser("~/.agent/memory"))
 DEFAULT_DB_PATH = DEFAULT_MEMORY_DIR / "index.db"
+MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 def log(msg: str, level: str = "INFO"):
     ts = datetime.now().strftime("%H:%M:%S")
@@ -36,8 +37,50 @@ def assert_close(actual, expected, tolerance: float, msg: str):
     log(f"{msg}: {actual}", "PASS")
     return True
 
+def ensure_migrations_applied():
+    """
+    Check for pending migrations and auto-apply them.
+    Returns (success, message).
+    """
+    try:
+        from migrations.runner import get_pending_migrations, run_all_pending
+
+        pending = get_pending_migrations(MIGRATIONS_DIR, str(DEFAULT_DB_PATH))
+
+        if not pending:
+            return True, "All migrations applied"
+
+        pending_ids = [m["migration_id"] for m in pending]
+        log(f"Pending migrations detected: {pending_ids}")
+        log("Auto-applying migrations...")
+
+        result = run_all_pending(MIGRATIONS_DIR, str(DEFAULT_DB_PATH), dry_run=False)
+
+        if result["success"]:
+            log(f"Applied migrations: {result['applied']}")
+            return True, f"Applied {len(result['applied'])} migrations"
+        else:
+            return False, f"Migration failed: {result['failed']}"
+
+    except Exception as e:
+        return False, f"Migration check error: {e}"
+
+
 def run_smoke_tests():
     """Run all smoke tests. Returns True if all pass."""
+
+    # Log the DB path being used (prevents wrong-DB debugging pain)
+    log(f"Using DB: {DEFAULT_DB_PATH}")
+    log(f"Memory dir: {DEFAULT_MEMORY_DIR}")
+
+    # Ensure migrations are applied before testing
+    migration_ok, migration_msg = ensure_migrations_applied()
+    if not migration_ok:
+        log(f"MIGRATION FAILED: {migration_msg}", "FAIL")
+        log(f"Fix: python migrations/runner.py {DEFAULT_DB_PATH} up")
+        return False
+    log(migration_msg)
+
     store = ArtifactStore(DEFAULT_MEMORY_DIR, DEFAULT_DB_PATH)
 
     # Ensure index is up to date
