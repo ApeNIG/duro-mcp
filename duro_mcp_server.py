@@ -32,6 +32,7 @@ from skills import DuroSkills
 from rules import DuroRules
 from artifacts import ArtifactStore
 from orchestrator import Orchestrator
+from embeddings import embed_artifact, compute_content_hash, EMBEDDING_CONFIG
 
 # Load configuration
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -82,6 +83,46 @@ def _startup_ensure_consistency():
         print(f"[WARN] FTS rebuild failed: {fts_result}", file=sys.stderr)
 
 _startup_ensure_consistency()
+
+
+def _embed_artifact_sync(artifact_id: str) -> bool:
+    """
+    Synchronously embed an artifact immediately after storage.
+
+    This ensures embeddings are generated inline rather than queued,
+    providing immediate vector search capability.
+
+    Args:
+        artifact_id: The artifact ID to embed
+
+    Returns:
+        True if embedding succeeded, False otherwise
+    """
+    try:
+        # Load the artifact
+        artifact = artifact_store.get_artifact(artifact_id)
+        if not artifact:
+            return False
+
+        # Generate embedding
+        embedding = embed_artifact(artifact)
+        if not embedding:
+            # No embedding needed (empty text or unsupported type)
+            return True
+
+        # Store embedding
+        content_hash = compute_content_hash(artifact)
+        model_name = EMBEDDING_CONFIG["model_name"]
+
+        return artifact_store.index.upsert_embedding(
+            artifact_id=artifact_id,
+            embedding=embedding,
+            content_hash=content_hash,
+            model_name=model_name
+        )
+    except Exception as e:
+        print(f"[WARN] Sync embedding failed for {artifact_id}: {e}", file=sys.stderr)
+        return False
 
 
 def _startup_health_check() -> dict:
@@ -2055,29 +2096,44 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             artifact_type = arguments.get("artifact_type")
             all_artifacts = arguments.get("all", False)
 
-            queued = []
+            # Collect artifact IDs to process
+            to_process = []
 
             if artifact_ids:
                 # Specific IDs
-                for aid in artifact_ids:
-                    embedding_queue.queue_for_embedding(aid)
-                    queued.append(aid)
+                to_process = artifact_ids
             elif artifact_type:
                 # All of a type
                 results = artifact_store.query(artifact_type=artifact_type, limit=10000)
-                for r in results:
-                    embedding_queue.queue_for_embedding(r["id"])
-                    queued.append(r["id"])
+                to_process = [r["id"] for r in results]
             elif all_artifacts:
                 # Everything
                 results = artifact_store.query(limit=10000)
-                for r in results:
-                    embedding_queue.queue_for_embedding(r["id"])
-                    queued.append(r["id"])
+                to_process = [r["id"] for r in results]
             else:
                 return [TextContent(type="text", text="No artifacts specified. Use artifact_ids, artifact_type, or all=true.")]
 
-            text = f"## Re-embed Queued\n\n**Queued:** {len(queued)} artifacts for re-embedding.\n\nThe embedding worker will process these in the background."
+            # Process embeddings synchronously instead of queuing
+            embedded = 0
+            failed = 0
+            skipped = 0
+
+            for aid in to_process:
+                result = _embed_artifact_sync(aid)
+                if result:
+                    embedded += 1
+                else:
+                    # Check if artifact exists - if not, skip; if yes, mark as failed
+                    artifact = artifact_store.get_artifact(aid)
+                    if artifact:
+                        failed += 1
+                    else:
+                        skipped += 1
+
+            # Also clear any pending items from queue (they're now processed)
+            cleared = embedding_queue.clear_queue()
+
+            text = f"## Re-embed Complete\n\n**Processed:** {len(to_process)} artifacts\n- Embedded: {embedded}\n- Failed: {failed}\n- Skipped (not found): {skipped}\n- Pending queue cleared: {cleared}"
             return [TextContent(type="text", text=text)]
 
         elif name == "duro_maintenance_report":
@@ -2158,6 +2214,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 provenance=arguments.get("provenance", "unknown")
             )
             if success:
+                # Embed synchronously for immediate vector search
+                _embed_artifact_sync(artifact_id)
                 text = f"Fact stored successfully.\n- ID: {artifact_id}\n- Path: {path}"
             else:
                 text = f"Failed to store fact: {path}"
@@ -2175,6 +2233,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 sensitivity=arguments.get("sensitivity", "internal")
             )
             if success:
+                # Embed synchronously for immediate vector search
+                _embed_artifact_sync(artifact_id)
                 text = f"Decision stored successfully.\n- ID: {artifact_id}\n- Path: {path}"
             else:
                 text = f"Failed to store decision: {path}"
@@ -2584,6 +2644,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             )
 
             if success:
+                # Embed synchronously for immediate vector search
+                _embed_artifact_sync(episode_id)
                 text = f"Episode created successfully.\n- ID: `{episode_id}`\n- Goal: {goal[:100]}...\n- Status: open"
             else:
                 text = f"Failed to create episode: {path}"
@@ -2622,6 +2684,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             success, message = artifact_store.update_episode(episode_id, updates)
 
             if success:
+                # Re-embed with result_summary now included
+                _embed_artifact_sync(episode_id)
                 # Get updated episode to show duration
                 episode = artifact_store.get_artifact(episode_id)
                 duration = episode["data"].get("duration_mins", "?")
@@ -2647,6 +2711,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             )
 
             if success:
+                # Embed synchronously for immediate vector search
+                _embed_artifact_sync(eval_id)
                 text = f"Evaluation created.\n- ID: `{eval_id}`\n- Episode: `{episode_id}`\n- Grade: {grade}\n- Memory updates pending: {len(memory_updates.get('reinforce', []))} reinforce, {len(memory_updates.get('decay', []))} decay"
             else:
                 text = f"Failed to create evaluation: {path}"
