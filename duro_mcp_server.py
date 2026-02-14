@@ -1765,7 +1765,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             result = f"""## Duro System Status
 
 **Memory**
-- Memory files: {mem_stats['total_memory_files']}
+- Active logs: {mem_stats['active_logs']}
+- Summaries: {mem_stats['summaries']}
+- Archived: {mem_stats['archived_logs']}
 - Core memory: {'Yes' if mem_stats['core_memory_exists'] else 'No'}
 - Today's log: {'Yes' if mem_stats['today_file_exists'] else 'No'}
 
