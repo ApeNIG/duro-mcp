@@ -11,7 +11,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from time_utils import utc_now, utc_now_iso
+from time_utils import utc_now, utc_now_iso, normalize_iso_z
 from typing import Any, Optional
 
 # Check for sqlite-vec availability at module load
@@ -379,8 +379,12 @@ class ArtifactIndex:
             as_of: Query as of this time (ISO string). Defaults to now.
 
         Returns list of current facts (not superseded, valid_from <= now, valid_until > now or NULL).
+
+        Note on pinned: Pinned facts still respect temporal bounds. Pinned = "don't decay",
+        not "ignore time". A pinned fact with valid_until in the past is still excluded.
         """
-        now = as_of or utc_now_iso()
+        # Normalize as_of to consistent Z format for reliable text comparison
+        now = normalize_iso_z(as_of) if as_of else utc_now_iso()
 
         # Core temporal conditions:
         # 1. Not superseded

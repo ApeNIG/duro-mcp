@@ -54,3 +54,18 @@ def days_since(iso_string: str) -> int:
     created = parse_iso_datetime(iso_string)
     now = utc_now()
     return (now - created).days
+
+
+def normalize_iso_z(iso_string: str) -> str:
+    """
+    Normalize any ISO datetime string to consistent Z-suffix format.
+
+    Handles:
+    - 2026-02-14T00:00:00Z → unchanged
+    - 2026-02-14T00:00:00+00:00 → 2026-02-14T00:00:00Z
+    - 2026-02-14T00:00:00 (naive) → 2026-02-14T00:00:00Z (assumed UTC)
+
+    Use this to ensure DB text comparisons work correctly.
+    """
+    dt = parse_iso_datetime(iso_string)
+    return dt.isoformat().replace("+00:00", "Z")
