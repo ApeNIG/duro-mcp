@@ -45,7 +45,7 @@ rules = DuroRules(CONFIG)
 
 # Initialize artifact store (dual-store: files + SQLite index)
 MEMORY_DIR = Path(CONFIG["paths"]["memory_dir"])
-DB_PATH = MEMORY_DIR / "artifacts.db"
+DB_PATH = MEMORY_DIR / "index.db"  # Single source of truth for SQLite index
 artifact_store = ArtifactStore(MEMORY_DIR, DB_PATH)
 
 # Startup: ensure directories exist, seed core skills, and reindex
@@ -2205,7 +2205,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             from migrations.runner import get_status, run_all_pending, run_migration
 
             migrations_dir = Path(__file__).parent / "migrations"
-            db_path = str(MEMORY_DIR / "artifacts.db")
+            db_path = str(DB_PATH)  # Use same DB_PATH as main server
 
             if action == "status":
                 status = get_status(migrations_dir, db_path)
