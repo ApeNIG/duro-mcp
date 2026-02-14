@@ -128,10 +128,10 @@ def run_smoke_tests():
     else:
         log("Applied evaluation")
 
-    # Verify confidence bump
+    # Verify confidence bump (capped at 0.99 ceiling)
     after_artifact = store.get_artifact("ss_planning")
     after_conf = after_artifact["data"]["confidence"]
-    expected_conf = round(baseline_conf + 0.01, 2)
+    expected_conf = min(0.99, round(baseline_conf + 0.01, 2))
 
     if not assert_close(after_conf, expected_conf, 0.001, "Confidence after new format"):
         all_passed = False
@@ -189,9 +189,9 @@ def run_smoke_tests():
             log("Normalization breadcrumb missing", "FAIL")
             all_passed = False
 
-    # Verify confidence bump with default delta
+    # Verify confidence bump with default delta (capped at 0.99 ceiling)
     after2 = store.get_artifact("ss_planning")["data"]["confidence"]
-    expected2 = round(baseline2 + 0.01, 2)  # Default delta for legacy
+    expected2 = min(0.99, round(baseline2 + 0.01, 2))  # Default delta for legacy
 
     if not assert_close(after2, expected2, 0.001, "Confidence after legacy format"):
         all_passed = False
@@ -271,9 +271,9 @@ def run_smoke_tests():
     else:
         log("Applied evaluation")
 
-    # Verify confidence bump (+0.01 for success)
+    # Verify confidence bump (+0.01 for success, capped at 0.99)
     after3 = store.get_artifact("ss_auto_test")["data"]["confidence"]
-    expected3 = round(baseline3 + 0.01, 2)
+    expected3 = min(0.99, round(baseline3 + 0.01, 2))
 
     if not assert_close(after3, expected3, 0.001, "Confidence after auto-update"):
         all_passed = False
@@ -366,9 +366,9 @@ def run_smoke_tests():
     else:
         log("Applied evaluation")
 
-    # Verify ss_planning got +0.01
+    # Verify ss_planning got +0.01 (capped at 0.99)
     after_planning = store.get_artifact("ss_planning")["data"]["confidence"]
-    expected_planning = round(baseline_planning + 0.01, 2)
+    expected_planning = min(0.99, round(baseline_planning + 0.01, 2))
     if not assert_close(after_planning, expected_planning, 0.001, "ss_planning confidence (should increase)"):
         all_passed = False
 

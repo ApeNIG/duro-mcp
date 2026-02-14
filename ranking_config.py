@@ -14,10 +14,7 @@ Key Design Decisions:
 from datetime import datetime, timezone
 from typing import Optional
 
-
-def _utc_now() -> datetime:
-    """Return current UTC time as timezone-aware datetime."""
-    return datetime.now(timezone.utc)
+from time_utils import utc_now, parse_iso_datetime, days_since
 
 
 # Main Ranking Config
@@ -104,14 +101,12 @@ def calculate_recency_boost(created_at: str, now: Optional[datetime] = None) -> 
 
     try:
         if now is None:
-            now = _utc_now()
+            now = utc_now()
 
-        # Parse created_at
-        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-        if created.tzinfo:
-            created = created.replace(tzinfo=None)
+        # Parse created_at (returns timezone-aware datetime)
+        created = parse_iso_datetime(created_at)
 
-        # Calculate days since creation
+        # Calculate days since creation (both are timezone-aware)
         days_old = (now - created).days
 
         if days_old < 0:
@@ -206,10 +201,7 @@ def calculate_decay(fact: dict) -> float:
     created_at = fact.get("created_at", "")
     if created_at:
         try:
-            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            if created.tzinfo:
-                created = created.replace(tzinfo=None)
-            days_old = (_utc_now() - created).days
+            days_old = days_since(created_at)
             if days_old < DECAY_CONFIG["grace_period_days"]:
                 return current
         except Exception:

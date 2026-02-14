@@ -44,27 +44,28 @@ def up(db_path: str) -> dict:
     result = {"success": False, "fts5_created": False, "vec_created": False, "message": ""}
 
     try:
-        # Check if migration already applied
+        # Check if migration already applied (via schema_migrations or by checking tables exist)
         cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='migrations'"
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
         )
         if cursor.fetchone():
             cursor = conn.execute(
-                "SELECT 1 FROM migrations WHERE id = ?", (MIGRATION_ID,)
+                "SELECT 1 FROM schema_migrations WHERE migration_id = ?", (MIGRATION_ID,)
             )
             if cursor.fetchone():
                 result["success"] = True
                 result["message"] = "Migration already applied"
                 return result
 
-        # Create migrations tracking table if not exists
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS migrations (
-                id TEXT PRIMARY KEY,
-                applied_at TEXT NOT NULL,
-                details TEXT
-            )
-        """)
+        # Also check if FTS table exists (migration may have been applied before runner existed)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='artifact_fts'"
+        )
+        if cursor.fetchone():
+            result["success"] = True
+            result["fts5_created"] = True
+            result["message"] = "Migration already applied (tables exist)"
+            return result
 
         # Create FTS5 table for full-text search
         # Using standalone FTS5 (not external content) for simplicity
@@ -152,20 +153,8 @@ def up(db_path: str) -> dict:
         else:
             result["message"] = "sqlite-vec not available. FTS-only mode enabled."
 
-        # Record migration
-        import json
-        from datetime import datetime, timezone
-        conn.execute(
-            "INSERT INTO migrations (id, applied_at, details) VALUES (?, ?, ?)",
-            (
-                MIGRATION_ID,
-                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                json.dumps({
-                    "fts5_created": result["fts5_created"],
-                    "vec_created": result["vec_created"]
-                })
-            )
-        )
+        # Note: Migration tracking handled by runner.py via schema_migrations table
+        # Migration just needs to do its work and return result
 
         conn.commit()
         result["success"] = True
@@ -201,8 +190,8 @@ def down(db_path: str) -> dict:
         conn.execute("DROP TABLE IF EXISTS artifact_vectors")
         conn.execute("DROP TABLE IF EXISTS embedding_state")
 
-        # Remove migration record
-        conn.execute("DELETE FROM migrations WHERE id = ?", (MIGRATION_ID,))
+        # Remove migration record (from schema_migrations, managed by runner)
+        conn.execute("DELETE FROM schema_migrations WHERE migration_id = ?", (MIGRATION_ID,))
 
         conn.commit()
         result["success"] = True
@@ -240,13 +229,13 @@ def check_status(db_path: str) -> dict:
     }
 
     try:
-        # Check if migration was applied
+        # Check if migration was applied (via schema_migrations)
         cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='migrations'"
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
         )
         if cursor.fetchone():
             cursor = conn.execute(
-                "SELECT 1 FROM migrations WHERE id = ?", (MIGRATION_ID,)
+                "SELECT 1 FROM schema_migrations WHERE migration_id = ?", (MIGRATION_ID,)
             )
             status["applied"] = cursor.fetchone() is not None
 

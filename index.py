@@ -11,15 +11,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-
-def _utc_now() -> datetime:
-    """Return current UTC time as timezone-aware datetime."""
-    return datetime.now(timezone.utc)
-
-
-def _utc_now_iso() -> str:
-    """Return current UTC time as ISO string with Z suffix."""
-    return _utc_now().isoformat().replace("+00:00", "Z")
+from time_utils import utc_now, utc_now_iso
 from typing import Any, Optional
 
 # Check for sqlite-vec availability at module load
@@ -483,7 +475,7 @@ class ArtifactIndex:
                 """, (
                     artifact_id,
                     content_hash,
-                    _utc_now_iso(),
+                    utc_now_iso(),
                     model_name
                 ))
 

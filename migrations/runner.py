@@ -11,9 +11,13 @@ Provides:
 import hashlib
 import importlib.util
 import sqlite3
-from datetime import datetime, timezone
+import sys
 from pathlib import Path
 from typing import Optional
+
+# Add parent dir to path for time_utils import
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from time_utils import utc_now_iso
 
 
 def _compute_checksum(file_path: Path) -> str:
@@ -167,7 +171,7 @@ def run_migration(
             """,
             (
                 migration_id,
-                datetime.now(timezone.utc).isoformat(),
+                utc_now_iso(),
                 _compute_checksum(migration_path),
                 json.dumps(result["details"])
             )
